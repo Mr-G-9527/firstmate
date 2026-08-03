@@ -103,10 +103,48 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it alwa
 - Unreadable hook input remains fail-open.
 - No harness adapter uses a shell ampersand to manufacture supervision.
 
+## Wake backstop for the daemon+argv session topology
+
+Empirical record (2026-08-03, same machine, same Claude Code 2.1.220, same hook shape; one variable changed - the session topology):
+
+- A bare interactive `claude` from a tmux pane receives `asyncRewake` after a Stop-hook exit 2.
+- A firstmate primary under `claude -> claude.exe daemon run --origin transient -> bg-pty-host -> claude.exe --session-id ... -- <prompt>` does NOT. The prompt arrives via `argv` and there is no attached input surface for the rewake to inject into.
+- Background Bash task completions DO re-invoke the same idle primary (observed 2/2). The proven delivery branch is therefore "a bash subprocess completes", not "asyncRewake fires".
+
+Consequence: a primary that goes idle while a wake is in flight stays silent indefinitely. `bin/fm-claude-stop-autoarm.sh` writes `outcome=rewake` into `state/.claude-autoarm-epoch`; nothing on the firstmate side then re-evaluates anything once the turn has ended. The watcher closes that gap.
+
+### Shape (chosen to keep ownership clean)
+
+- The already-running watcher is the one armed supervision cycle. The backstop is NOT a second cycle. The watcher calls `bin/fm-watch-backstop.sh should-fire` at the start of every cycle; on a 1 verdict it calls `bin/fm-watch-backstop.sh fire`, which spawns a detached `inject` bash task via `setsid + &`. The watcher's own loop is never blocked.
+- The detached bash task (the delivery plumbing, not an arm): re-checks `state/.claude-autoarm-epoch` for `outcome=rewake`, reads `state/.wake-queue` for the undelivered rewake row, consumes that row under the same lock `bin/fm-wake-drain.sh` uses, encodes the payload with the canonical watcher-kind operational-input envelope (`bin/fm-operational-input.sh`), resolves the supervisor pane through the same discovery the away-mode daemon uses (`bin/fm-supervisor-target-lib.sh`), and types it via `bin/fm-backend.sh`'s `fm_backend_send_text_submit` (the same primitive `bin/fm-supervise-daemon.sh`'s `inject_msg` uses). On confirmed delivery the epoch is rewritten with `outcome=consumed` so the watcher stops re-firing for the same rewake.
+
+`asyncRewake` is retained as the opportunistic fast path. The backstop is the second line of defense, not a replacement.
+
+### Design decisions settled before the code was written
+
+- **"Watcher observed the wake was consumed" is bounded by TIMEOUT, not by positive confirmation.** The wake is the only signal that a consume happened, and firstmate can only emit that signal after the rewake has already delivered - so in the failure case the observation never occurs. The backstop is a timer, not an oracle. The default grace is `FM_WATCH_BACKSTOP_GRACE=60` seconds, which clears `FM_CLAUDE_AUTOARM_EPOCH_FRESH` (15s) plus typical background-task notification latency. A value below the synchronous window races `asyncRewake`; a value above leaves the idle session silent for that long. Both are bad, so the default is the one the 2026-08-03 evidence supported.
+- **Idempotency is owned by the bash task, not the watcher.** The watcher can only check once at spawn time; the race window between the watcher's spawn and the bash task's inject is owned by the task itself. The task re-checks the epoch TWICE - once after locating the row, once immediately before consuming it - so an `asyncRewake` that lands in the same window aborts the inject cleanly. The watcher never re-fires for the same `updated_at` because the task writes a `.watch-backstop-consumed-<updated_at>` marker on confirmed delivery.
+- **Test isolation is fail-closed.** The inject path requires `FM_WATCH_BACKSTOP_CONFIRM_INJECT=1` before it will actually call the backend send primitive. The watcher's `fire` always sets this; a probe that supplies a non-live state must opt in explicitly. A probe that forgets to mock the backend and leaves the confirm flag unset will abort at the gate with a clear log rather than deliver a real wake to the captain. (The 2026-08-03 incident that motivated this change was exactly that mistake: a probe against a scratch state dir with the default `firstmate:0` target.)
+- **One supervision cycle is preserved.** `bin/fm-watch-arm.sh` is not called by the backstop. The bash task is delivery plumbing: a child process of the already-armed watcher, never a separate arm. `bin/fm-watch-arm.sh` still exits non-zero on a second arm attempt.
+
+### Operational tuning
+
+- `FM_WATCH_BACKSTOP_GRACE` (default 60) - seconds of `outcome=rewake` survival before the backstop fires. Lowering this races `asyncRewake`; raising it lengthens the silence window.
+- `FM_WATCH_BACKSTOP_DISABLE=1` - emergency kill switch. Suppresses the `fire` subcommand entirely; the watcher continues to monitor and absorb.
+- `FM_WATCH_BACKSTOP_CONFIRM_INJECT=1` - opt-in gate for the inject's send step. The watcher's `fire` sets this; tests that drive the inject directly must set it themselves with a mocked backend.
+- `FM_WATCH_BACKSTOP_BIN` (default `bin/fm-watch-backstop.sh`) - override the helper location. The watcher uses this to allow a hermetic test to point at a stub.
+
+### Constraint self-check
+
+- One supervision cycle - satisfied: the watcher is the cycle; the bash task is delivery plumbing, not an arm.
+- Stop-hook ownership not duplicated - satisfied: `bin/fm-turnend-guard.sh` keeps sole ownership of the Stop emit; the backstop only adds a delivery attempt after the preferred one demonstrably failed.
+- `AGENTS.md` section 1 - satisfied: this is firstmate shared tracked material; the change ships through the repo's own delivery path (a local-only fast-forward merge), never by firstmate directly.
+
 ## Regression coverage
 
-`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
+`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, epoch allow, re-block budget, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
 `tests/fm-guard-stale-banner.test.sh` covers the pull-guard predicate, including the persistent-model fresh-leftover-beacon negative control, the auto-arm model's healthy fresh-beacon-without-a-watcher case and its stale-beacon alarm, the true-reason banner wording, and the reason-keyed episode dedup surviving a beacon mtime change.
+`tests/fm-watch-backstop.test.sh` covers the wake-backstop trigger conditions, idempotency re-checks, the paused-defect routing, the `FM_WATCH_BACKSTOP_CONFIRM_INJECT` test-isolation gate, and the `fire` subcommand's confirm-flag pass-through.
 `tests/fm-kimi-harness.test.sh` covers the separate Kimi crew hook's format preservation, idempotence, refusal cases, token guard, spawn registration, and teardown cleanup.
 `tests/fm-supervision-instructions.test.sh` covers recovery-line ownership and pi-signed's identity-preserving reuse of Pi's protocol.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` is the opt-in isolated Pi path.

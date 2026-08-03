@@ -780,9 +780,9 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "live external-decision gate retained the wedge timer"; }
   reap "$pid"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  annotated=$(grep -F "awaiting external - declared pause, immediate surface" "$state/.wake-queue" | grep -F "$window" >/dev/null && echo 1 || echo 0)
   [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
-  [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
+  [ "$annotated" -eq 1 ] || fail "live external-decision gate lost its immediate annotated pause surface"
   pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
 }
 

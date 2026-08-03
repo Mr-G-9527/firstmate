@@ -86,6 +86,40 @@ mkdir -p "$STATE"
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
+# Wake backstop path (2026-08-03, item 1 in
+# data/handoff-2026-08-03-wake-and-lint.md): Claude Code's Stop-hook
+# asyncRewake does NOT re-invoke an idle primary session under the
+# daemon+argv topology. bin/fm-claude-stop-autoarm.sh writes
+# `outcome=rewake` into state/.claude-autoarm-epoch when it has an
+# actionable wake; the watcher monitors that epoch. Once FM_WATCH_BACKSTOP_GRACE
+# seconds have elapsed with the rewake row still unconsumed, the watcher
+# spawns a detached bash task (bin/fm-watch-backstop.sh inject) that
+# re-checks the epoch, consumes the rewake row, and injects the message
+# into the primary pane via the same channel the away-mode daemon uses.
+# The backstop is the second line of defense; asyncRewake is retained as
+# the opportunistic fast path. See docs/turnend-guard.md "Wake backstop
+# for the daemon+argv topology" for the design contract.
+WATCH_BACKSTOP_BIN=${FM_WATCH_BACKSTOP_BIN:-$SCRIPT_DIR/fm-watch-backstop.sh}
+
+# fm_backstop_tick: cheap per-cycle trigger check. Returns 0 when the
+# backstop fired (and the detached child is on its way), 1 otherwise.
+# Pure read: calls bin/fm-watch-backstop.sh should-fire and, on 1, spawns
+# the detached inject via bin/fm-watch-backstop.sh fire. This is the
+# only call site the watcher needs; the helper owns all re-check and
+# idempotency logic so a watcher process crash does not leave a half-
+# configured backstop in place.
+fm_backstop_tick() {
+  if [ ! -x "$WATCH_BACKSTOP_BIN" ]; then
+    return 1
+  fi
+  local should
+  should=$("$WATCH_BACKSTOP_BIN" should-fire "$STATE" 2>/dev/null || echo 0)
+  if [ "$should" = "1" ]; then
+    "$WATCH_BACKSTOP_BIN" fire "$STATE" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
 # The singleton-lock acquisition, EXIT trap, and the blocking supervision loop
 # all live below the source guard at the very bottom of this file (see "Main
 # entry"). Sourcing this file for unit tests therefore loads the functions -
@@ -324,8 +358,24 @@ busy_turn_over_age() {  # <task>
 # timer would. A .paused-resurfaced-<key> throttle marker records the last
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
-handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+#
+# First-sight flag (2026-08-03 paused-defect fix): the dead-agent path
+# (captain-held transfer where the agent has exited) still absorbs on
+# first sight - the captain knows the hold exists, and an immediate wake
+# would re-surface what the hold already explained. The LIVE-agent path
+# (a crew on a declared pause that has not exited) needs ONE immediate
+# surface so a live external-decision gate is not hidden behind
+# PAUSE_RESURFACE_SECS, but every subsequent pane change must NOT
+# re-fire the bare "stale: ..." wake (the 2-minute every-poll loop
+# recorded in data/handoff-2026-08-03-wake-and-lint.md). The fourth
+# arg `first_sight_fire` (= "fire" for the live-agent path) opts the
+# caller into the immediate surface; the default ("absorb") preserves
+# the captain-held dead-agent behavior. A successful surface in either
+# branch sets the .paused-resurfaced-<key> marker so subsequent
+# long-cadence re-surfaces fire at the configured interval, not on
+# every poll.
+handle_paused_stale() {  # <window> <task> <hash> [first_sight_fire]
+  local win=$1 task=$2 h=$3 first_sight_fire=${4:-absorb} key statusf mtime age rf rf_age reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
@@ -336,13 +386,18 @@ handle_paused_stale() {  # <window> <task> <hash>
   age=$(( $(date +%s) - mtime ))
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
-  if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
+  if [ "$first_sight_fire" = "fire" ] && [ "$rf_age" -ge 999999 ]; then
+    reason="stale: $win (paused ${age}s, awaiting external - declared pause, immediate surface so a live wait is not hidden behind the long cadence; confirm the wait still holds)"
+    fm_wake_append stale "$win" "$reason" || exit 1
+    date +%s > "$rf"
+    wake "$reason"
+  elif [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
     reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
     fm_wake_append stale "$win" "$reason" || exit 1
     date +%s > "$rf"
     wake "$reason"
   fi
-  triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
+  triage_log "absorbed stale (paused, awaiting external, age ${age}s, first_sight_fire=$first_sight_fire): $win"
 }
 
 clear_pause_state() {  # <window>
@@ -413,19 +468,33 @@ pause_state_class() {  # <window> <task>
 
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
+  task=$(window_to_task "$win" "$STATE")
+  last=$(last_status_line "$STATE/$task.status")
+  # Pause defect fix (2026-08-03): the main loop's pause_state_class case
+  # only returns "paused" when the agent is confidently dead. A live agent
+  # on a declared pause or captain hold falls into the default "*" case
+  # and previously bypassed handle_paused_stale, so the bare "stale: <win>"
+  # wake fired on every poll instead of using the long PAUSE_RESURFACE_SECS
+  # cadence (the 2-minute every-poll loop recorded in
+  # data/handoff-2026-08-03-wake-and-lint.md). Route through
+  # handle_paused_stale here so the throttle markers and the
+  # "(paused Ns, awaiting external ...)" annotation are both honored, and
+  # pass "fire" so the live-agent first sight still surfaces immediately -
+  # the dead-agent captain-held path (which still calls handle_paused_stale
+  # via the case statement above) absorbs on first sight, and a surface in
+  # either path writes .paused-resurfaced-<key> so the long cadence governs
+  # every subsequent recheck. The non-paused path keeps its original
+  # behavior: write the hash, drop any stale paused-throttle markers, and
+  # wake with the bare reason.
+  if status_is_paused_or_captain_held "$last"; then
+    handle_paused_stale "$win" "$task" "$h" fire
+    return
+  fi
   key=$(printf '%s' "$win" | tr ':/.' '___')
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
-  task=$(window_to_task "$win" "$STATE")
-  last=$(last_status_line "$STATE/$task.status")
-  if status_is_paused_or_captain_held "$last"; then
-    : > "$STATE/.paused-$key"
-    date +%s > "$STATE/.paused-rechecked-$key"
-    date +%s > "$STATE/.paused-resurfaced-$key"
-  else
-    rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
-  fi
+  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
   wake "stale: $win"
 }
 
@@ -793,6 +862,15 @@ while :; do
   # Then deliver any queued-but-unsurfaced result, including one a runner
   # published while this watcher was between cycles.
   procevent_surface_queued
+
+  # Wake backstop (2026-08-03, item 1 in
+  # data/handoff-2026-08-03-wake-and-lint.md). asyncRewake does not
+  # re-invoke this idle primary under the daemon+argv topology. The
+  # backstop fires a detached bash task that consumes the unconsumed
+  # rewake row and injects the message into the primary pane. Cheap
+  # per-cycle check; the helper decides whether to fire. NO event
+  # emission here - the backstop is delivery plumbing, not an arm.
+  fm_backstop_tick || true
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
