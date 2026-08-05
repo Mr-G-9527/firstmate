@@ -245,6 +245,13 @@ command_hold() {
   validate_slug decision-key "$key"
   validate_one_line title "$title"
   validate_one_line reason "$reason"
+  # fm friction #3 (2026-08-05): tasks_axi rejects parens in --reason. Detect
+  # early + tell the user to rephrase (e.g. cite line ranges as L513-517, not
+  # (controller:513-517)) rather than failing inscrutably downstream.
+  case "$reason" in
+    *'('*|*')'*)
+      fail "--reason cannot contain parentheses (tasks_axi rejects them). Rephrase without parens; cite line ranges as L513-517 or 'controller 513-517', not (controller:513-517). Got: $reason" ;;
+  esac
   case "$reason" in *'('*|*')'*) fail "reason must not contain parentheses (tasks-axi hold contract)" ;; esac
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"

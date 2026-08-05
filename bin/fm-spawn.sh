@@ -294,8 +294,9 @@ if [ "$TRACEPARENT_SET" -eq 1 ]; then
   }
 fi
 case "$EFFORT" in
+  default) EFFORT=high ;;  # profile sentinel -> concrete (fm friction #1, 2026-08-05)
   ''|low|medium|high|xhigh|max) ;;
-  *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
+  *) echo "error: --effort must be one of low, medium, high, xhigh, max (or 'default' for high)" >&2; exit 1 ;;
 esac
 
 # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
