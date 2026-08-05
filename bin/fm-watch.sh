@@ -517,7 +517,11 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # swallows a signal.
 scan_signals() {
   local f sig sf
-  for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
+  # P2 (2026-08-04 codex C*): also scan state/captain-inbox.jsonl so a row
+  # landing while fm is already idle/live surfaces a wake without /fm-wake.
+  # The same size:mtime discipline (.seen-<basename>) keeps the offset
+  # observation atomic and idempotent across watcher restarts.
+  for f in "$STATE"/*.status "$STATE"/*.turn-ended "$STATE/captain-inbox.jsonl"; do
     [ -e "$f" ] || continue
     sig=$(stat_sig "$f") || continue
     sf="$STATE/.seen-$(basename "$f" | tr '.' '_')"
@@ -956,7 +960,26 @@ while :; do
     done <<EOF
 $pending
 EOF
-    reason="signal:$files"
+    # P2 (2026-08-04 codex C*, live-fix): when captain-inbox.jsonl is the
+    # changed file, the inbox MUST drain without /fm-wake. Run the drain
+    # here so its output (chat blocks + dispatch markers) flows to the
+    # watcher's stdout; arm.sh captures it, and the hook banner shows the
+    # chat block on the rewake. The drain also advances the inbox offset,
+    # so subsequent drains are no-ops until new rows land.
+    inbox_drain_out=
+    inbox_drain_rc=0
+    if case "$files" in *captain-inbox.jsonl*) true ;; *) false ;; esac; then
+      inbox_drain_out=$("$SCRIPT_DIR/fm-captain-inbox-drain.sh" 2>&1) || inbox_drain_rc=$?
+    fi
+    if [ -n "$inbox_drain_out" ]; then
+      # Compose a wake payload that embeds the drain's rendered output.
+      # fm_wake_append's payload cleaner tr/newlines to spaces, so collapse
+      # here to one tab-separated block per drained row.
+      collapsed=$(printf '%s' "$inbox_drain_out" | awk 'BEGIN{RS=""; ORS=" | "} {gsub(/\n/, " "); print}' | sed 's/ | $//')
+      reason="inbox-drain rc=${inbox_drain_rc}: ${collapsed}"
+    else
+      reason="signal:$files"
+    fi
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;

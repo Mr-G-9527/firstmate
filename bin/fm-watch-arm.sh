@@ -352,17 +352,21 @@ trap 'handle_attached_signal INT 130' INT
 
 watch_output_has_wake() {
   local out=$1
-  grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null
+  # P2 (2026-08-04 live-fix): include inbox-drain as an actionable wake
+  # prefix so the hook rewakes Claude when the watcher's auto-drain path
+  # produced a payload (chat blocks + dispatch markers, even on rc=1).
+  grep -Eq '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$out" 2>/dev/null
 }
 
 watch_output_reason_type() {
   local out=$1 line
-  line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null | head -1 || true)
+  line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$out" 2>/dev/null | head -1 || true)
   case "$line" in
     signal:*) printf 'actionable-signal' ;;
     stale:*) printf 'actionable-stale' ;;
     check:*) printf 'actionable-check' ;;
     heartbeat*) printf 'actionable-heartbeat' ;;
+    inbox-drain*) printf 'actionable-inbox-drain' ;;
     *) printf 'none' ;;
   esac
 }

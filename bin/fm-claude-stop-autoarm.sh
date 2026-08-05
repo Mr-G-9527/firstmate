@@ -96,7 +96,14 @@ RECOVER_SESSION_LOCK=0
 if ! fm_session_lock_owned_by_self "$STATE"; then
   LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
   case "$LOCK_PID" in
-    ''|*[!0-9]*) exit 0 ;;
+    # Missing or malformed lock: treat as recoverable uncertainty rather
+    # than inert silence. Delegate the guarded acquire to fm-lock.sh so its
+    # live-owner refusal still protects a competing session. This is the
+    # single behavior difference from the original contract: a session
+    # whose lock was lost mid-life (e.g. an operator cleanup of a stale
+    # flock record) now re-establishes ownership instead of dropping every
+    # subsequent Stop into the void.
+    ''|*[!0-9]*) RECOVER_SESSION_LOCK=1 ;;
   esac
   fm_harness_pid_alive "$LOCK_PID" && exit 0
   RECOVER_SESSION_LOCK=1

@@ -310,10 +310,17 @@ if [ "$READ_ONLY" -eq 1 ]; then
   [ -n "$GUARD_OUT" ] && printf '%s\n' "$GUARD_OUT"
 else
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  # P2 (2026-08-04 codex C*): also drain the captain inbox so a row that
+  # landed mid-session (after the watcher's surface wake arrived) actually
+  # moves into this LLM context. Byte-offset based; idempotent on re-run.
+  INBOX_DRAIN_OUT=$("$SCRIPT_DIR/fm-captain-inbox-drain.sh" 2>&1) || true
   if [ -n "$DRAIN_OUT" ]; then
     printf '%s\n' "$DRAIN_OUT"
   else
     printf '(no queued wakes)\n'
+  fi
+  if [ -n "$INBOX_DRAIN_OUT" ]; then
+    printf '%s\n' "$INBOX_DRAIN_OUT"
   fi
 fi
 

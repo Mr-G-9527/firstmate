@@ -2,6 +2,9 @@
 # fm-captain-inbox-append.sh - append one captain inbox row + enqueue wake.
 # Body on stdin. WSL-owned seq. --json prints {corr,kind,seq} to stdout.
 # kind: chat|authorize|decision-reply|cancel-request
+# Optional --task-type carries the controller's task type (e.g.
+# report_research) so the inbox-drain can route it to a fresh-context
+# worker instead of dumping the body into the live LLM context.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,10 +20,12 @@ mkdir -p "$STATE"
 KIND=chat
 CORR=
 JSON=0
+TASK_TYPE=
 while [ $# -gt 0 ]; do
   case "$1" in
     --kind) KIND="${2:-chat}"; shift 2 ;;
     --corr) CORR="${2:-}"; shift 2 ;;
+    --task-type) TASK_TYPE="${2:-}"; shift 2 ;;
     --json) JSON=1; shift ;;
     --) shift; break ;;
     *) echo "fm-captain-inbox-append: unknown arg: $1" >&2; exit 2 ;;
@@ -37,7 +42,11 @@ SEQ="$(awk -F'"seq":' 'NF>1{v=$2; sub(/[^0-9].*/,"",v); if (v+0>max) max=v+0} EN
 case "$SEQ" in ''|*[!0-9]*) SEQ=1 ;; esac
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-ROW="$(jq -cn --arg ts "$TS" --arg corr "$CORR" --arg kind "$KIND" --arg body "$BODY" --argjson seq "$SEQ" '{ts:$ts,corr:$corr,kind:$kind,body:$body,seq:$seq}')"
+if [ -n "$TASK_TYPE" ]; then
+  ROW="$(jq -cn --arg ts "$TS" --arg corr "$CORR" --arg kind "$KIND" --arg task_type "$TASK_TYPE" --arg body "$BODY" --argjson seq "$SEQ" '{ts:$ts,corr:$corr,kind:$kind,task_type:$task_type,body:$body,seq:$seq}')"
+else
+  ROW="$(jq -cn --arg ts "$TS" --arg corr "$CORR" --arg kind "$KIND" --arg body "$BODY" --argjson seq "$SEQ" '{ts:$ts,corr:$corr,kind:$kind,body:$body,seq:$seq}')"
+fi
 echo "$ROW" >> "$INBOX"
 
 fm_wake_append signal captain-inbox "captain-inbox: seq=$SEQ corr=$CORR" || true
