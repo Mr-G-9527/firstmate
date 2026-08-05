@@ -195,21 +195,26 @@ fi
 # 3d. Wait only for the exact preallocated session file. A bounded wait keeps
 # the inbox retry boundary fail-closed if Claude never starts.
 WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-15}"
-deadline=$(( $(date +%s) + WAIT_SECONDS ))
-while [ "$(date +%s)" -lt "$deadline" ] && [ ! -s "$SESSION_FILE" ]; do
-  sleep 0.5
-done
-
-if [ ! -s "$SESSION_FILE" ]; then
-  tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
-  rm -f "$DATA_BRIEF"
-  {
-    printf 'session_id capture failed: expected %s within %ss\n' \
-      "$SESSION_FILE" "$WAIT_SECONDS"
-    printf 'window=%s\n' "$WINDOW_TARGET"
-  } >> "$SPAWN_OUT"
-  echo "fm-research-worker-spawn: spawn failed (session $SESSION_ID absent within ${WAIT_SECONDS}s); see $SPAWN_OUT" >&2
-  exit 1
+if [ "${FM_RESEARCH_WORKER_SKIP_SESSION_WAIT:-0}" = "1" ]; then
+  # test hook: fake tmux cannot simulate claude -p writing the session file;
+  # tests set this to skip the real-session wait. production never sets it.
+  :
+else
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ] && [ ! -s "$SESSION_FILE" ]; do
+    sleep 0.5
+  done
+  if [ ! -s "$SESSION_FILE" ]; then
+    tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
+    rm -f "$DATA_BRIEF"
+    {
+      printf 'session_id capture failed: expected %s within %ss\n' \
+        "$SESSION_FILE" "$WAIT_SECONDS"
+      printf 'window=%s\n' "$WINDOW_TARGET"
+    } >> "$SPAWN_OUT"
+    echo "fm-research-worker-spawn: spawn failed (session $SESSION_ID absent within ${WAIT_SECONDS}s); see $SPAWN_OUT" >&2
+    exit 1
+  fi
 fi
 
 # ----- 4. translate meta --------------------------------------------------
