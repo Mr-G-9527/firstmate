@@ -132,6 +132,14 @@ Harness identity is read from the executable path and `argv[0]` as well as the c
 `tests/fm-session-lock-ancestry.test.sh` pins both platforms' reporting semantics behind a deterministic process table and runs the real Stop auto-arm in version-named, daemon-parented, and combined real process trees.
 `tests/fm-watch-arm.test.sh` runs a real watcher and attached arm to verify that a delivered reason survives queue draining, while an unrelated queue append cannot make a watcher cycle that delivered nothing look successful.
 
+On 2026-08-05, a live Claude primary running `claude -p` was found to keep a
+static rendered pane during legitimate tool work. Hash-based stale detection is
+therefore explicitly disabled only for the canonical target recorded in
+`state/firstmate.meta`; child worker panes retain normal stale and wedge
+supervision. The focused regression in `tests/fm-watch-triage.test.sh` proves a
+stable primary creates neither wake nor queue entry while a stable child still
+surfaces.
+
 The Claude product live path ran with Claude Code 2.1.219 on 2026-07-24:
 
 ```sh

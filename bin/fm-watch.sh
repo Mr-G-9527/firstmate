@@ -1004,6 +1004,17 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
+    # The primary firstmate pane owns this watcher. A claude -p tool call can
+    # leave its rendered pane static without being dead; surfacing that pane as
+    # stale re-wakes the owner and creates a self-triggering Stop-hook loop.
+    # Worker panes remain subject to ordinary stale/wedge supervision.
+    if [ -f "$STATE/firstmate.meta" ] &&
+      [ "$(fm_backend_target_of_meta "$STATE/firstmate.meta" 2>/dev/null || true)" = "$w" ]; then
+      key=$(printf '%s' "$w" | tr ':/.' '___')
+      rm -f "$STATE/.hash-$key" "$STATE/.count-$key"
+      clear_pause_tracking "$w"
+      continue
+    fi
     key=${w//:/_}
     key=${key//\//_}
     key=${key//./_}

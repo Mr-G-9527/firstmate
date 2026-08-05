@@ -456,6 +456,50 @@ test_terminal_stale_surfaced() {
   pass "a stale pane sitting on a terminal status is surfaced (queue + exit)"
 }
 
+# --- primary pane stale is ignored; child worker stale still surfaces ---------
+# The primary Claude pane is the harness that owns this watcher. `claude -p` can
+# keep its rendered footer static during a legitimate tool call, so hash-based
+# staleness must never re-wake that primary. Child workers retain normal stale
+# detection.
+test_primary_stale_is_ignored_but_child_stale_surfaces() {
+  local dir state fakebin out capture_file window key pane_hash pid
+
+  dir=$(make_case primary-stale-ignored); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="firstmate:0"
+  printf 'static primary claude output\n' > "$capture_file"
+  printf 'window=%s\nkind=primary\nharness=claude\n' "$window" > "$state/firstmate.meta"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "static primary claude output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "primary pane stale exited the watcher: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "primary pane stale emitted a wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "primary pane stale enqueued a wake"
+  reap "$pid"
+
+  dir=$(make_case child-stale-still-surfaces); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="firstmate:fm-worker"
+  printf 'static child output\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/worker.meta"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "static child output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "child stale pane did not surface"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "child stale pane did not retain normal stale behavior: $(cat "$out")"
+  pass "primary stale is ignored while a child stale pane still surfaces"
+}
+
 # --- stale pane, STALE terminal status overridden by an active run: absorbed ---
 # Regression for the 2026-07 herdr false-surface incidents: a crew's own status
 # log gets no new entry once firstmate hands it to a no-mistakes validation
@@ -1813,6 +1857,7 @@ test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
+test_primary_stale_is_ignored_but_child_stale_surfaces
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
