@@ -13,10 +13,11 @@
 #      then launch a fresh `claude` process inside that window with the brief
 #      as its initial prompt. The fresh REPL gives each task its own clean
 #      LLM context (P2 spec: "Each task starts in its own fresh context").
-#   4. Capture the new claude session_id deterministically: snapshot the
-#      encoded-cwd session dir BEFORE launch, then poll the same dir AFTER
-#      launch for a *.jsonl whose basename (sans .jsonl) is the new session id.
-#      The encoded-cwd mapping is the one Claude Code itself uses under
+#   4. Capture the new claude session_id deterministically: preallocate a UUID
+#      before launch and pass it as `claude --session-id <uuid>`. After launch,
+#      wait for the exact `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` to
+#      appear (no shared-dir polling, no snapshot-then-diff race). The
+#      encoded-cwd mapping is the one Claude Code itself uses under
 #      ~/.claude/projects/ (each / and . in the cwd becomes a '-').
 #   5. Translate that session_id into state/<task-id>.meta (window, no
 #      worktree) + data/executor-jobs/<corr>.meta (the long-lived record).
@@ -104,6 +105,13 @@ task_id: $TASK_ID
 $ROW_JSON
 \`\`\`
 
+## Setup (gh research — only if cloning/fetching github.com or reading raw.githubusercontent.com)
+If this task needs GitHub read access, source the read-only proxy env first:
+```
+source /home/fm-captain/firstmate/bin/fm-proxy-env.sh
+```
+Exports http_proxy/https_proxy to Windows host proxy:7890 (WSL2 NAT gateway, resolved dynamically). No credentials, read-only. For push, do NOT attempt locally — escalate to captain (B2 path: fm produces commits, captain pushes via Windows gh-axi).
+
 ## What you do
 You are a fresh-context worker. The row JSON above is the task spec from
 the controller. Extract \`must_answer\`, \`evidence.windows_roots\`,
@@ -187,21 +195,26 @@ fi
 # 3d. Wait only for the exact preallocated session file. A bounded wait keeps
 # the inbox retry boundary fail-closed if Claude never starts.
 WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-15}"
-deadline=$(( $(date +%s) + WAIT_SECONDS ))
-while [ "$(date +%s)" -lt "$deadline" ] && [ ! -s "$SESSION_FILE" ]; do
-  sleep 0.5
-done
-
-if [ ! -s "$SESSION_FILE" ]; then
-  tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
-  rm -f "$DATA_BRIEF"
-  {
-    printf 'session_id capture failed: expected %s within %ss\n' \
-      "$SESSION_FILE" "$WAIT_SECONDS"
-    printf 'window=%s\n' "$WINDOW_TARGET"
-  } >> "$SPAWN_OUT"
-  echo "fm-research-worker-spawn: spawn failed (session $SESSION_ID absent within ${WAIT_SECONDS}s); see $SPAWN_OUT" >&2
-  exit 1
+if [ "${FM_RESEARCH_WORKER_SKIP_SESSION_WAIT:-0}" = "1" ]; then
+  # test hook: fake tmux cannot simulate claude -p writing the session file;
+  # tests set this to skip the real-session wait. production never sets it.
+  :
+else
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ] && [ ! -s "$SESSION_FILE" ]; do
+    sleep 0.5
+  done
+  if [ ! -s "$SESSION_FILE" ]; then
+    tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
+    rm -f "$DATA_BRIEF"
+    {
+      printf 'session_id capture failed: expected %s within %ss\n' \
+        "$SESSION_FILE" "$WAIT_SECONDS"
+      printf 'window=%s\n' "$WINDOW_TARGET"
+    } >> "$SPAWN_OUT"
+    echo "fm-research-worker-spawn: spawn failed (session $SESSION_ID absent within ${WAIT_SECONDS}s); see $SPAWN_OUT" >&2
+    exit 1
+  fi
 fi
 
 # ----- 4. translate meta --------------------------------------------------
