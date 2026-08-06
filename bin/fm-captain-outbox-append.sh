@@ -108,6 +108,11 @@ if ! printf '%s' "$ROW" | jq -e . >/dev/null 2>&1; then
   echo "fm-captain-outbox-append: row is not valid JSON" >&2
   exit 3
 fi
+ROW_STATE_VALUE="$(printf '%s' "$ROW" | jq -r '.state // empty')"
+if [ "$ROW_STATE_VALUE" = accepted ]; then
+  echo "fm-captain-outbox-append: state=accepted is captain/controller-only; use needs-decision" >&2
+  exit 4
+fi
 
 # Acquire the shared flock, append, release. The lock file path is
 # state/.captain-outbox.lock - same as bin/fm-review-submit.sh.

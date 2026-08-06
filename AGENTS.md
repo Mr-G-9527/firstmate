@@ -325,6 +325,7 @@ Apart from that single supported abort, do not hand-edit, commit, restart, or st
 Once ownership is settled, validate exactly once against that final head so no obsolete or intermediate head is ever treated as authoritative.
 
 An ask-user finding returns as `needs-decision`; firstmate decides only when the configured authority permits, otherwise escalates to the captain.
+For FM Workcell inbox work, a natural-language message is intake only; execution starts only from a typed canonical Work Order. `task_type=report_research` rows and their review/reminder follow-ups are harness-owned and worker-exclusive: the primary must not execute, resubmit, accept, resume, or override them. The harness alone emits `state=received`; workers submit artifacts; `state=accepted`, production restart, race resolution, and paused-job recovery belong to the captain/controller. When authority is absent, emit `needs-decision` and stop.
 Send the same worker one exact decision naming the decision key, step, action, affected finding IDs, instructions where needed, and exact response command.
 Require the matching `resolved` event, forbid `--yes`, and require the worker to process every synchronous return until completion or a genuinely new escalation.
 Resume fleet supervision immediately after the decision lands.

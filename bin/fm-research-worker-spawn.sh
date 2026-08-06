@@ -42,7 +42,7 @@
 #                                 reuses firstmate's resolved store (matches
 #                                 bin/fm-spawn.sh's env-forward contract).
 #   FM_RESEARCH_WORKER_SESSION_WAIT  seconds to poll for the new *.jsonl before
-#                                   giving up (default 15). Tests may lower it.
+#                                   giving up (default 60). Tests may lower it.
 #
 # Exit:
 #   0  spawn succeeded (or was already-done idempotent) -- meta is readable
