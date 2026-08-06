@@ -219,7 +219,7 @@ fi
 
 # 3d. Wait only for the exact preallocated session file. A bounded wait keeps
 # the inbox retry boundary fail-closed if Claude never starts.
-WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-15}"
+WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-60}"
 if [ "${FM_RESEARCH_WORKER_SKIP_SESSION_WAIT:-0}" = "1" ]; then
   # test hook: fake tmux cannot simulate claude -p writing the session file;
   # tests set this to skip the real-session wait. production never sets it.

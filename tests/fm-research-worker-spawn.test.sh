@@ -32,6 +32,10 @@ INBOX_DRAIN="$ROOT/bin/fm-captain-inbox-drain.sh"
 [ -x "$SPAWN_HELPER" ] || fail "research-worker-spawn not executable"
 [ -x "$INBOX_DRAIN" ]  || fail "captain-inbox-drain not executable"
 
+grep -F 'WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-60}"' "$SPAWN_HELPER" >/dev/null \
+  || fail "worker session wait must default to 60 seconds"
+pass "0. worker receipt default is 60 seconds"
+
 TMP_ROOT=$(fm_test_tmproot fm-research-worker-spawn)
 
 #======================================================================
