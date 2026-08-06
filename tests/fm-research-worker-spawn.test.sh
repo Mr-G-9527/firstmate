@@ -95,6 +95,7 @@ done
 session_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$proj_dir" | tr '/.' '--')"
 mkdir -p "$session_dir"
 printf '%s\n' "$*" >> "${FM_FAKE_CLAUDE_LOG:?}"
+[ -z "${FM_FAKE_WORKER_MODE_LOG:-}" ] || printf '%s\n' "${FM_RESEARCH_WORKER:-}" >> "$FM_FAKE_WORKER_MODE_LOG"
 echo "{\"sessionId\":\"$session_id\",\"type\":\"start\"}" > "$session_dir/$session_id.jsonl"
 exit 0
 SH
@@ -117,6 +118,7 @@ export FM_FAKE_TMUX_LOG="$CASE/fake-tmux.log"
 export FM_FAKE_CLAUDE_LOG="$CASE/fake-claude.log"
 export FM_FAKE_CLAUDE_PROJECT_DIR="$CASE"
 export FM_RESEARCH_WORKER_SESSION_WAIT=5
+export FM_FAKE_WORKER_MODE_LOG="$TMP_ROOT/worker-mode.log"
 
 CORR="rws-idemp-$RANDOM"
 ROW_JSON='{"task_type":"report_research","must_answer":["Q1"]}'
@@ -251,7 +253,39 @@ SESSION_B="$(grep '^session_id=' "$CASE/data/executor-jobs/$CORR_B.meta" | cut -
 pass "4. two distinct report_research tasks -> two distinct session_ids"
 
 #======================================================================
-# Case 5: tmux window creation failure must stop before launch
+# Case 5: revision gets a new worker without replacing the original receipt
+#======================================================================
+CASE="$TMP_ROOT/revision"
+mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"
+export FM_HOME="$CASE"
+export FM_ROOT_OVERRIDE="$CASE"
+export CLAUDE_CONFIG_DIR="$CASE/.claude"
+export PATH="$FAKEBIN:$PATH"
+export FM_FAKE_TMUX_LOG="$CASE/fake-tmux.log"
+export FM_FAKE_CLAUDE_LOG="$CASE/fake-claude.log"
+export FM_FAKE_CLAUDE_PROJECT_DIR="$CASE"
+export FM_RESEARCH_WORKER_SESSION_WAIT=5
+CORR="rws-revision-$RANDOM"
+ORIGINAL_BRIEF="$CASE/data/executor-jobs/$CORR.brief.md"
+printf '%s\n' '# original task' > "$ORIGINAL_BRIEF"
+cat > "$CASE/data/executor-jobs/$CORR.meta" <<META
+corr=$CORR
+session_id=original-session
+brief=$ORIGINAL_BRIEF
+META
+FM_RESEARCH_WORKER_REVISION_SEQ=84 \
+  bash "$SPAWN_HELPER" "$CORR" '{"seq":84,"body":"[fm cross-model review] revise Q1"}' "$CASE" >/dev/null 2>&1 \
+  || fail "5. revision spawn failed"
+[ -f "$CASE/data/executor-jobs/$CORR.revision-84.meta" ] \
+  || fail "5. revision meta missing"
+grep -F "Revision mode" "$CASE/data/executor-jobs/$CORR.revision-84.brief.md" >/dev/null \
+  || fail "5. revision brief missing original-task context"
+grep -Fx '1' "$TMP_ROOT/worker-mode.log" >/dev/null \
+  || fail "5. worker launch did not set FM_RESEARCH_WORKER=1"
+pass "5. normal and revision workers use worker mode and preserve the original receipt"
+
+#======================================================================
+# Case 6: tmux window creation failure must stop before launch
 #======================================================================
 CASE="$TMP_ROOT/tmux-create-fail"
 mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"
@@ -282,7 +316,7 @@ esac
 pass "5. tmux create failure is fail-closed before claude launch"
 
 #======================================================================
-# Case 6: fail-closed when no session_id is captured
+# Case 7: fail-closed when no session_id is captured
 #======================================================================
 CASE="$TMP_ROOT/fail-closed"
 mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"

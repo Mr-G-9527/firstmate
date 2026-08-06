@@ -44,6 +44,7 @@ fi
 SPAWN_FAILED=0
 SPAWN_HELPER="${FM_RESEARCH_WORKER_SPAWN:-$SCRIPT_DIR/fm-research-worker-spawn.sh}"
 PROJECT_DIR="${FM_RESEARCH_WORKER_PROJECT_DIR:-$FM_HOME}"
+META_DIR="${FM_EXECUTOR_JOBS_DIR:-$FM_HOME/data/executor-jobs}"
 
 # read unprocessed rows (from byte OFFSET+1 onward), parse + build render/ack
 # and maybe dispatch to the fresh-context worker. Process substitution (rather
@@ -60,6 +61,15 @@ while IFS= read -r line || [ -n "$line" ]; do
   KIND="$(printf '%s' "$line" | jq -r '.kind // "chat"' 2>/dev/null)" || KIND=chat
   SEQ="$(printf '%s' "$line" | jq -r '.seq // 0' 2>/dev/null)" || SEQ=0
   TASK_TYPE="$(printf '%s' "$line" | jq -r '.task_type // empty' 2>/dev/null)" || TASK_TYPE=
+  REVISION_SEQ=
+  # Controller feedback has no task_type. Route only the exact review marker
+  # for a corr with a durable report_research receipt to a fresh revision worker.
+  BODY="$(printf '%s' "$line" | jq -r '.body // empty' 2>/dev/null)" || BODY=
+  if [ -z "$TASK_TYPE" ] && [ "$KIND" = chat ] && [ -f "$META_DIR/$CORR.meta" ] \
+      && printf '%s' "$BODY" | grep -Fq '[fm cross-model review'; then
+    TASK_TYPE=report_research
+    REVISION_SEQ="$SEQ"
+  fi
   case "$TASK_TYPE" in
     report_research)
       # P2 (2026-08-04 codex C*): each report_research task gets its own
@@ -68,9 +78,10 @@ while IFS= read -r line || [ -n "$line" ]; do
       # body. The helper is idempotent on data/executor-jobs/<corr>.meta
       # so a re-drain (offset reset) does not duplicate short-lived workers.
       SPAWN_OUT="$ACK_TMP.spawn.${CORR}"
-      if [ -x "$SPAWN_HELPER" ] && "$SPAWN_HELPER" "$CORR" "$line" "$PROJECT_DIR" > "$SPAWN_OUT" 2>&1; then
+      if [ -x "$SPAWN_HELPER" ] \
+          && FM_RESEARCH_WORKER_REVISION_SEQ="$REVISION_SEQ" "$SPAWN_HELPER" "$CORR" "$line" "$PROJECT_DIR" > "$SPAWN_OUT" 2>&1; then
         SESSION_ID="$(grep '^session_id=' "$SPAWN_OUT" 2>/dev/null | cut -d= -f2- || true)"
-        printf '%s\n' "task dispatched: corr=$CORR task_type=$TASK_TYPE session=$SESSION_ID" >> "$RENDER_TMP"
+        printf '%s\n' "task dispatched: corr=$CORR task_type=$TASK_TYPE revision=${REVISION_SEQ:-0} session=$SESSION_ID" >> "$RENDER_TMP"
         printf '{"ts":"%s","corr":"%s","state":"received","text":"","seq":%s}\n' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CORR" "$SEQ" >> "$ACK_TMP"
       else

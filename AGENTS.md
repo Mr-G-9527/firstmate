@@ -127,6 +127,10 @@ Treat `data/captain.md` as the domain-local record of captain preferences, optio
 ## 3. Session start (run once at every session start)
 
 Run `bin/fm-session-start.sh` exactly once at session start.
+
+### Fresh report-research worker exception
+
+When `FM_RESEARCH_WORKER=1`, this is a bounded worker under the primary session's ownership. **Do not run** `bin/fm-session-start.sh`, `bin/fm-lock.sh`, bootstrap, wake-drain, watcher arming, or fleet operations: those compete for the primary fleet lock. Read only the declared evidence, write the declared report, and use the declared `bin/fm-review-submit.sh` call.
 Its header is the single owner of composed commands, ordering, and digest contents.
 `bin/fm-supervision-instructions.sh` renders the emitted supervision block from `docs/supervision-protocols/`.
 Do not reimplement it by separately running its lock, bootstrap, or initial wake-drain components.
