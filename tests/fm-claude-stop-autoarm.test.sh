@@ -5,8 +5,8 @@
 # The hook fires as a Claude asyncRewake Stop hook. These tests run it hermetically
 # as a child of a fake harness (a bash symlink named "claude") whose pid is
 # written into the fixture home's state/.lock for ordinary owned-lock cases.
-# Stale-owner cases instead leave a dead recorded pid for the hook to reclaim
-# through the real fm-lock.sh path. The arm wrapper is a per-test fixture, so no
+# Stale-owner cases must remain inert: only a newly started primary may claim
+# the session lock. The arm wrapper is a per-test fixture, so no
 # real watcher, model, or fleet state is touched.
 # shellcheck disable=SC2016 # single quotes are deliberate: $FM_HOME expands inside the fake harness child, and grep needles are literal strings
 set -u
@@ -202,24 +202,20 @@ test_inert_without_session_lock() {
   pass "auto-arm: inert with no session lock"
 }
 
-test_reclaims_stale_session_lock_before_arming() {
-  local dir out status expected_owner actual_owner
+test_stale_session_lock_is_inert() {
+  local dir out status owner_after
   dir=$(make_primary_dir "$TMP_ROOT/stale-lock")
   : > "$dir/state/task.meta"
   printf '9999999\n' > "$dir/state/.lock"
   write_arm_fixture "$dir" actionable
   out=$(printf '%s\n' '{"session_id":"stale"}' \
-    | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
-        printf "%s\n" "$$" > "$FM_HOME/state/expected-owner"
-        "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
-      ' 2>&1); status=$?
-  expect_code 2 "$status" "a dead recorded session owner must be reclaimed before the actionable rewake"
-  expected_owner=$(cat "$dir/state/expected-owner")
-  actual_owner=$(cat "$dir/state/.lock")
-  [ "$actual_owner" = "$expected_owner" ] || fail "stale session lock was not claimed by the current harness: expected $expected_owner, got $actual_owner"
-  [ -e "$dir/state/arm-ran" ] || fail "hook did not arm after reclaiming the stale session lock"
-  [ "$(epoch_outcome "$dir")" = rewake ] || fail "stale-lock recovery must record outcome=rewake"
-  pass "auto-arm: a demonstrably dead recorded session owner is reclaimed through fm-lock.sh before arming"
+    | FM_HOME="$dir" "$FAKE_CLAUDE" -c '"$FM_HOME/bin/fm-claude-stop-autoarm.sh"' 2>&1); status=$?
+  expect_code 0 "$status" "an orphan Stop hook must not reclaim a dead primary lock"
+  owner_after=$(cat "$dir/state/.lock")
+  [ "$owner_after" = 9999999 ] || fail "orphan Stop hook replaced stale lock owner: $owner_after"
+  [ ! -e "$dir/state/arm-ran" ] || fail "orphan Stop hook armed after the primary lock died"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "orphan Stop hook wrote an epoch"
+  pass "auto-arm: stale session lock stays inert until a new primary starts"
 }
 
 test_inert_when_lock_held_by_other_harness() {
@@ -577,7 +573,7 @@ test_fm_lock_status_still_works_with_shared_lib() {
 
 test_inert_in_child_worktree
 test_inert_without_session_lock
-test_reclaims_stale_session_lock_before_arming
+test_stale_session_lock_is_inert
 test_inert_when_lock_held_by_other_harness
 test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates

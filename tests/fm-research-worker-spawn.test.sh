@@ -8,19 +8,17 @@
 #   2. Direct tmux path: the helper calls tmux new-window with the
 #      project_dir (NOT a treehouse worktree path) and launches claude
 #      --dangerously-skip-permissions with the brief as the initial prompt.
-#   3. Session-id capture: the helper discovers the new claude's
-#      session_id by polling ~/.claude/projects/<encoded-cwd>/ for a new
-#      *.jsonl file (no fm-spawn.sh involvement, no treehouse get).
+#   3. Session identity: the helper preallocates a session_id and never treats
+#      Claude's asynchronous jsonl persistence as a worker-start receipt.
 #   4. Distinct sessions per task: two distinct <corr> values produce two
 #      distinct session_ids in their executor-jobs/<corr>.meta files
 #      (the P2 spec's "each task starts in its own fresh context").
-#   5. Fail-closed: a spawn that yields no session_id within the wait
-#      budget exits non-zero WITHOUT writing executor-jobs/<corr>.meta,
-#      so a re-drain can retry.
+#   5. A missing Claude jsonl does not kill a successfully sent worker command;
+#      the report-submission timeout remains the failure boundary.
 #
 # Stubbing strategy: fake tmux + fake claude on PATH. The fake claude
-# creates a fake session jsonl in $CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/
-# to match the helper's polling location.
+# records the preallocated session id. The spawn helper must not depend on
+# the JSONL store as a readiness signal.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -32,9 +30,9 @@ INBOX_DRAIN="$ROOT/bin/fm-captain-inbox-drain.sh"
 [ -x "$SPAWN_HELPER" ] || fail "research-worker-spawn not executable"
 [ -x "$INBOX_DRAIN" ]  || fail "captain-inbox-drain not executable"
 
-grep -F 'WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-60}"' "$SPAWN_HELPER" >/dev/null \
-  || fail "worker session wait must default to 60 seconds"
-pass "0. worker receipt default is 60 seconds"
+grep -F 'LAUNCH_CMD="exec env FM_RESEARCH_WORKER=1' "$SPAWN_HELPER" >/dev/null \
+  || fail "worker launch must exec the one-shot claude process"
+pass "0. worker pane execs claude without a jsonl readiness gate"
 
 TMP_ROOT=$(fm_test_tmproot fm-research-worker-spawn)
 
@@ -85,9 +83,8 @@ chmod +x "$FAKEBIN/tmux"
 cat > "$FAKEBIN/claude" <<'SH'
 #!/usr/bin/env bash
 # Fake claude: require the production launch contract to preallocate a
-# session id, then materialize exactly that session file. This makes the test
-# catch both missing --session-id and wrong encoded-cwd lookup without racing
-# on whichever concurrent worker happens to create a jsonl first.
+# session id. It materializes a jsonl only to emulate normal Claude behavior;
+# a separate case proves that this persistence is not a spawn gate.
 proj_dir="${FM_FAKE_CLAUDE_PROJECT_DIR:?}"
 session_id=""
 prev=""
@@ -168,7 +165,8 @@ export FM_FAKE_CLAUDE_PROJECT_DIR="$CASE"
 export FM_RESEARCH_WORKER_SESSION_WAIT=5
 
 CORR="rws-direct-$RANDOM"
-ROW_JSON='{"task_type":"report_research","must_answer":["Q1"]}'
+ROW_JSON='{"task_type":"report_research","must_answer":["Q1"],"artifact_path":"data/declared/report.md"}'
+DECLARED_ARTIFACT="$CASE/data/declared/report.md"
 
 bash "$SPAWN_HELPER" "$CORR" "$ROW_JSON" "$CASE" >/dev/null 2>&1 \
   || fail "2. spawn failed: $(cat "$CASE/data/executor-jobs/$CORR.spawn.out" 2>/dev/null)"
@@ -194,8 +192,14 @@ grep -E -- "--permission-mode bypassPermissions.*--session-id" "$CASE/fake-claud
   || fail "2d. direct worker launch must use bypassPermissions + preallocated session id: $(cat "$CASE/fake-claude.log")"
 pass "2d. direct worker launch preallocates its session id"
 
+grep -Fx "artifact=$DECLARED_ARTIFACT" "$CASE/data/executor-jobs/$CORR.meta" >/dev/null \
+  || fail "2e. meta did not preserve the declared artifact: $(cat "$CASE/data/executor-jobs/$CORR.meta")"
+grep -F "Write \`$DECLARED_ARTIFACT\`" "$CASE/data/executor-jobs/$CORR.brief.md" >/dev/null \
+  || fail "2e. brief did not direct the worker to the declared artifact"
+pass "2e. declared artifact path flows into brief and durable meta"
+
 #======================================================================
-# Case 3: session_id capture from $CLAUDE_CONFIG_DIR/projects/<encoded>/
+# Case 3: preallocated session identity is persisted in state metadata
 #======================================================================
 CASE="$TMP_ROOT/session-capture"
 mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"
@@ -214,12 +218,13 @@ ROW_JSON='{"task_type":"report_research","must_answer":["Q1"]}'
 bash "$SPAWN_HELPER" "$CORR" "$ROW_JSON" "$CASE" >/dev/null 2>&1 \
   || fail "3. spawn failed: $(cat "$CASE/data/executor-jobs/$CORR.spawn.out" 2>/dev/null)"
 
-# session_id must appear in the meta and the state file.
+# session_id must appear in the meta and the state file without depending on
+# a Claude config-store file.
 SESSION_ID="$(grep '^session_id=' "$CASE/data/executor-jobs/$CORR.meta" | cut -d= -f2-)"
 [ -n "$SESSION_ID" ] || fail "3. session_id missing from meta"
 grep -E "^session_id=$SESSION_ID" "$CASE/state/executor-$CORR-"*.meta >/dev/null 2>&1 \
   || fail "3. session_id missing from state meta: $(ls "$CASE/state/" 2>/dev/null)"
-pass "3a. session_id captured from $CLAUDE_CONFIG_DIR/projects/<encoded>/"
+pass "3a. preallocated session_id persisted in state metadata"
 
 # state meta MUST NOT include a worktree= line (P3 spec: no worktree).
 grep -E "^worktree=" "$CASE/state/executor-$CORR-"*.meta >/dev/null 2>&1 \
@@ -320,9 +325,9 @@ esac
 pass "5. tmux create failure is fail-closed before claude launch"
 
 #======================================================================
-# Case 7: fail-closed when no session_id is captured
+# Case 7: absent Claude jsonl is not a false spawn failure
 #======================================================================
-CASE="$TMP_ROOT/fail-closed"
+CASE="$TMP_ROOT/no-jsonl"
 mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"
 export FM_HOME="$CASE"
 export FM_ROOT_OVERRIDE="$CASE"
@@ -331,45 +336,28 @@ export PATH="$FAKEBIN:$PATH"
 export FM_FAKE_TMUX_LOG="$CASE/fake-tmux.log"
 export FM_FAKE_CLAUDE_LOG="$CASE/fake-claude.log"
 export FM_FAKE_CLAUDE_PROJECT_DIR="$CASE"
-export FM_RESEARCH_WORKER_SESSION_WAIT=2  # tight wait so the test fails fast
 
-# Fake claude that does NOT write a session jsonl (simulates a slow
-# / never-starting claude).
-cat > "$FAKEBIN/claude-no-session" <<'SH'
+# Claude's config-store write is asynchronous and opaque. A command accepted
+# by the dedicated tmux window must keep its durable receipt even if that file
+# is absent; actual completion is proved by report submission.
+cat > "$FAKEBIN/claude" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
-chmod +x "$FAKEBIN/claude-no-session"
-# Make the helper invoke the no-session fake by pointing CLAUDE at it
-# via PATH (it sits before the real fake in PATH... no wait, we need
-# the no-session one to be the one that runs). Simplest: replace claude
-# in the fakebin with the no-session one for this case.
-cp "$FAKEBIN/claude-no-session" "$FAKEBIN/claude"
 chmod +x "$FAKEBIN/claude"
 
-CORR="rws-fail-$RANDOM"
+CORR="rws-no-jsonl-$RANDOM"
 ROW_JSON='{"task_type":"report_research","must_answer":["Q1"]}'
 
 set +e
 OUT="$(bash "$SPAWN_HELPER" "$CORR" "$ROW_JSON" "$CASE" 2>&1)"
 RC=$?
 set -e
-[ "$RC" != "0" ] || fail "6. helper must exit non-zero when session_id not captured (rc=$RC)"
-grep -E "session_id capture failed" "$CASE/data/executor-jobs/$CORR.spawn.out" >/dev/null \
-  || fail "6. spawn.out missing 'session_id capture failed' marker; out=$OUT; spawn.out=$(cat "$CASE/data/executor-jobs/$CORR.spawn.out" 2>/dev/null)"
-pass "6a. helper exits non-zero when no session_id is captured"
-
-# Critically: NO executor-jobs/<corr>.meta file.
-[ ! -f "$CASE/data/executor-jobs/$CORR.meta" ] \
-  || fail "5. meta file written despite spawn failure: $(cat "$CASE/data/executor-jobs/$CORR.meta")"
-pass "6b. no executor-jobs/<corr>.meta on failure (fail-closed contract)"
-
-# No state/<task-id>.meta either.
-shopt -s nullglob
-state_metas=("$CASE/state/executor-$CORR-"*.meta)
-shopt -u nullglob
-[ "${#state_metas[@]}" -eq 0 ] \
-  || fail "5. state meta written despite spawn failure: ${state_metas[*]}"
-pass "6c. no state/<task-id>.meta on failure"
+[ "$RC" = "0" ] || fail "6. helper must retain sent worker receipt when jsonl is absent (rc=$RC): $OUT"
+[ -f "$CASE/data/executor-jobs/$CORR.meta" ] \
+  || fail "6. durable meta missing despite a successful tmux dispatch"
+[ ! -e "$CASE/.claude/projects"/*/*.jsonl ] \
+  || fail "6. test setup unexpectedly wrote a Claude jsonl"
+pass "6. absent Claude jsonl does not kill or retry an accepted worker dispatch"
 
 echo "ok - all fm-research-worker-spawn tests passed"

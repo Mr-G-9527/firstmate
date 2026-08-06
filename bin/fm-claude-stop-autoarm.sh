@@ -87,27 +87,11 @@ cat >/dev/null 2>&1 || true
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 # --- identity: only the lock-owning session's hooks may arm ------------------
-# A prior session may have died after leaving its numeric harness pid in .lock.
-# Use the shared liveness predicate to recognize only that stale-owner case.
-# Defer the mutating claim until after the unchanged AFK and need gates, so an
-# idle or away home remains byte-for-byte inert. Missing or malformed locks are
-# uncertainty rather than stale-owner evidence and remain inert.
-RECOVER_SESSION_LOCK=0
-if ! fm_session_lock_owned_by_self "$STATE"; then
-  LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
-  case "$LOCK_PID" in
-    # Missing or malformed lock: treat as recoverable uncertainty rather
-    # than inert silence. Delegate the guarded acquire to fm-lock.sh so its
-    # live-owner refusal still protects a competing session. This is the
-    # single behavior difference from the original contract: a session
-    # whose lock was lost mid-life (e.g. an operator cleanup of a stale
-    # flock record) now re-establishes ownership instead of dropping every
-    # subsequent Stop into the void.
-    ''|*[!0-9]*) RECOVER_SESSION_LOCK=1 ;;
-  esac
-  fm_harness_pid_alive "$LOCK_PID" && exit 0
-  RECOVER_SESSION_LOCK=1
-fi
+# A Stop hook can outlive its primary as a bg-spare child. It must never reclaim
+# a missing or stale session lock: doing so turns an orphan into a new watcher
+# owner after the real primary has died. A new primary establishes ownership via
+# fm-lock.sh during session start; every non-owner Stop stays inert.
+fm_session_lock_owned_by_self "$STATE" || exit 0
 
 # --- AFK: the away daemon owns the watcher and triage; never rewake ----------
 [ -e "$STATE/.afk" ] && exit 0
@@ -117,15 +101,6 @@ need_supervision() {
   fm_supervision_needed "$STATE" "$GRACE"
 }
 need_supervision || exit 0
-
-# --- stale session-lock recovery ---------------------------------------------
-# Delegate the claim to fm-lock.sh so its live-owner refusal and write semantics
-# remain the single acquisition owner, then re-verify current-session identity
-# before touching any auto-arm state.
-if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
-  "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
-  fm_session_lock_owned_by_self "$STATE" || exit 0
-fi
 
 # --- single-flight owner claim ------------------------------------------------
 # Claude runs one background process per firing with no dedupe. Exactly one

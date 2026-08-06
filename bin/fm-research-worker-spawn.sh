@@ -14,11 +14,9 @@
 #      as its initial prompt. The fresh REPL gives each task its own clean
 #      LLM context (P2 spec: "Each task starts in its own fresh context").
 #   4. Capture the new claude session_id deterministically: preallocate a UUID
-#      before launch and pass it as `claude --session-id <uuid>`. After launch,
-#      wait for the exact `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` to
-#      appear (no shared-dir polling, no snapshot-then-diff race). The
-#      encoded-cwd mapping is the one Claude Code itself uses under
-#      ~/.claude/projects/ (each / and . in the cwd becomes a '-').
+#      before launch and pass it as `claude --session-id <uuid>`. This is an
+#      identity, not a launch receipt: Claude's opaque jsonl store may lag, so
+#      a successful tmux dispatch is durably recorded without waiting on it.
 #   5. Translate that session_id into state/<task-id>.meta (window, no
 #      worktree) + data/executor-jobs/<corr>.meta (the long-lived record).
 #
@@ -41,8 +39,6 @@
 #   CLAUDE_CONFIG_DIR             forwarded to the spawned claude so it
 #                                 reuses firstmate's resolved store (matches
 #                                 bin/fm-spawn.sh's env-forward contract).
-#   FM_RESEARCH_WORKER_SESSION_WAIT  seconds to poll for the new *.jsonl before
-#                                   giving up (default 60). Tests may lower it.
 #
 # Exit:
 #   0  spawn succeeded (or was already-done idempotent) -- meta is readable
@@ -99,6 +95,59 @@ if [ -f "$META_DIR/$RUN_KEY.meta" ]; then
 fi
 
 # ----- 2. build brief -----------------------------------------------------
+extract_row_artifact() {
+  python3 - "$ROW_JSON" <<'PY'
+import json, re, sys
+try:
+    row = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(0)
+
+candidate = row.get("artifact_path")
+if not candidate:
+    body = row.get("body") or row.get("text") or ""
+    match = re.search(r'--artifact\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))', body)
+    if match:
+        candidate = next(value for value in match.groups() if value is not None)
+if candidate:
+    print(candidate)
+PY
+}
+
+normalize_artifact_path() {
+  python3 - "$FM_HOME" "$1" <<'PY'
+import os, sys
+home, candidate = sys.argv[1:]
+root = os.path.abspath(os.path.join(home, "data"))
+candidate = os.path.expanduser(candidate)
+if not os.path.isabs(candidate):
+    candidate = os.path.join(home, candidate)
+path = os.path.abspath(candidate)
+try:
+    allowed = os.path.commonpath((root, path)) == root
+except ValueError:
+    allowed = False
+if not allowed:
+    raise SystemExit("artifact must stay under %s: %s" % (root, path))
+print(path)
+PY
+}
+
+if [ -n "$REVISION_SEQ" ]; then
+  ARTIFACT_CANDIDATE="$(awk -F= '/^artifact=/{sub(/^[^=]*=/, ""); print; exit}' "$ORIGINAL_META")"
+  if [ -z "$ARTIFACT_CANDIDATE" ]; then
+    ARTIFACT_CANDIDATE="$(sed -nE 's/^[[:space:]]*--artifact[[:space:]]+"([^"]+)".*/\1/p' "$ORIGINAL_BRIEF" | head -n1)"
+  fi
+else
+  ARTIFACT_CANDIDATE="$(extract_row_artifact)"
+fi
+ARTIFACT_CANDIDATE="${ARTIFACT_CANDIDATE:-$FM_HOME/data/$CORR/report.md}"
+ARTIFACT_PATH="$(normalize_artifact_path "$ARTIFACT_CANDIDATE")" || {
+  echo "fm-research-worker-spawn: invalid artifact path: $ARTIFACT_CANDIDATE" >&2
+  exit 2
+}
+mkdir -p "$(dirname "$ARTIFACT_PATH")"
+
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # The executor-jobs copy is the long-lived record (the meta cites it).
 # We keep the brief at $META_DIR/<corr>.brief.md (no separate FM_HOME copy;
@@ -141,7 +190,7 @@ the controller. Extract \`must_answer\`, \`evidence.windows_roots\`,
 the bounded research and produce a report.
 
 ## Output
-Write \`data/executor-jobs/$CORR.report.md\` following the
+Write \`$ARTIFACT_PATH\` following the
 codex-review-standard.md §2 minimum packet format (status header,
 Question, Background, Current Truth Read, Q1..QN, Verification,
 Known Tradeoffs, Need Codex Decision, Completion / Cleanup).
@@ -154,7 +203,7 @@ controller's review pipeline can pick it up:
 bash bin/fm-review-submit.sh \\
   --corr "$CORR" \\
   --reply-to-seq <seq-from-row-json> \\
-  --artifact "data/executor-jobs/$CORR.report.md"
+  --artifact "$ARTIFACT_PATH"
 \`\`\`
 
 (Extract the seq from the row JSON; if the controller did not include
@@ -179,13 +228,8 @@ SPAWN_RC=0
 # from whichever jsonl file appears next in a shared project directory.
 TMUX_SESSION="$(fm_backend_tmux_container_ensure)"
 WINDOW_NAME="fm-executor-${RUN_KEY}"
-CLAUDE_PROJECTS_BASE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
-CLAUDE_ENCODED_CWD="$(printf '%s' "$PROJECT_DIR" | tr '/.' '--')"
-CLAUDE_SESSION_DIR="$CLAUDE_PROJECTS_BASE/$CLAUDE_ENCODED_CWD"
 SESSION_ID="$(cat /proc/sys/kernel/random/uuid)"
-SESSION_FILE="$CLAUDE_SESSION_DIR/$SESSION_ID.jsonl"
 WORKER_LOG="$META_DIR/$RUN_KEY.worker.log"
-mkdir -p "$CLAUDE_SESSION_DIR"
 
 # 3b. Create the dedicated worker window. Preserve the backend adapter failure
 # code; `if ! command; then $?` would only observe the status of `!` (zero).
@@ -201,12 +245,13 @@ WINDOW_TARGET="${TMUX_SESSION}:${WINDOW_NAME}"
 
 # 3c. Launch a one-shot fresh worker. Pass the task through stdin rather than
 # typing its full content into tmux: task text cannot be reinterpreted as shell
-# syntax. `--session-id` is both the identity receipt and the exact file we
-# wait for below; no shared-directory diff is needed.
+# syntax. `exec` makes the one-shot pane close with claude -p, avoiding manual
+# numeric tmux cleanup. A sent command is the worker receipt; jsonl persistence
+# is intentionally not a readiness gate.
 printf -v Q_SESSION '%q' "$SESSION_ID"
 printf -v Q_BRIEF '%q' "$DATA_BRIEF"
 printf -v Q_LOG '%q' "$WORKER_LOG"
-LAUNCH_CMD="FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
+LAUNCH_CMD="exec env FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
 if fm_backend_tmux_send_text_line "$WINDOW_TARGET" "$LAUNCH_CMD"; then
   :
 else
@@ -215,31 +260,6 @@ else
   rm -f "$DATA_BRIEF"
   echo "fm-research-worker-spawn: send-keys to $WINDOW_TARGET failed rc=$SPAWN_RC" >&2
   exit 1
-fi
-
-# 3d. Wait only for the exact preallocated session file. A bounded wait keeps
-# the inbox retry boundary fail-closed if Claude never starts.
-WAIT_SECONDS="${FM_RESEARCH_WORKER_SESSION_WAIT:-60}"
-if [ "${FM_RESEARCH_WORKER_SKIP_SESSION_WAIT:-0}" = "1" ]; then
-  # test hook: fake tmux cannot simulate claude -p writing the session file;
-  # tests set this to skip the real-session wait. production never sets it.
-  :
-else
-  deadline=$(( $(date +%s) + WAIT_SECONDS ))
-  while [ "$(date +%s)" -lt "$deadline" ] && [ ! -s "$SESSION_FILE" ]; do
-    sleep 0.5
-  done
-  if [ ! -s "$SESSION_FILE" ]; then
-    tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
-    rm -f "$DATA_BRIEF"
-    {
-      printf 'session_id capture failed: expected %s within %ss\n' \
-        "$SESSION_FILE" "$WAIT_SECONDS"
-      printf 'window=%s\n' "$WINDOW_TARGET"
-    } >> "$SPAWN_OUT"
-    echo "fm-research-worker-spawn: spawn failed (session $SESSION_ID absent within ${WAIT_SECONDS}s); see $SPAWN_OUT" >&2
-    exit 1
-  fi
 fi
 
 # ----- 4. translate meta --------------------------------------------------
@@ -272,6 +292,7 @@ task_type=report_research
 brief=$META_BRIEF
 revision_seq=$REVISION_SEQ
 revision_of=$([ -z "$REVISION_SEQ" ] || printf '%s' "$CORR")
+artifact=$ARTIFACT_PATH
 META
 
 cat "$META_DIR/$RUN_KEY.meta"
