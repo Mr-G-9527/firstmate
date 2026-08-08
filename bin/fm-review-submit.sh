@@ -1,14 +1,65 @@
 #!/usr/bin/env bash
-# fm-review-submit.sh - emit a hash-bound report-submission terminal event.
-# Appends a done row to captain-outbox with kind=report-submission +
-# submission_id + artifact_path + artifact_sha256. Idempotent on
-# (corr, seq, kind, artifact_sha256). Best-effort push; outbox is truth.
-# The controller never infers completion from mtime; fm MUST call this helper.
+# fm-review-submit.sh - emit a hash-bound report-submission terminal event
+# AND write a consolidated code-diff receipt to data/<task-id>/receipt.diff.
+#
+# Behavior:
+#   1. Validate --task-id (optional), --corr, --reply-to-seq, --artifact,
+#      and --worktree.
+#   2. When --task-id is supplied, compute
+#        base_sha = `git -C <worktree> merge-base HEAD origin/main`,
+#      falling back to `git -C <worktree> merge-base HEAD main` when
+#      origin/main is unavailable, so multi-commit work yields ONE
+#      consolidated diff against the canonical base.
+#   3. Write data/<task-id>/receipt.diff containing
+#      `git -C <worktree> diff <base_sha> HEAD` BEFORE the existing
+#      captain-outbox JSONL append + best-effort push. The receipt
+#      lands on disk even when the network push later 429s; the outbox
+#      row becomes the submission record, and the diff file is the
+#      captain's review artifact.
+#   4. Append a done row to captain-outbox with kind=report-submission
+#      + submission_id + artifact_path + artifact_sha256. Idempotent
+#      on (corr, seq, kind, artifact_sha256). Best-effort push;
+#      outbox is truth. The controller never infers completion from
+#      mtime; fm MUST call this helper.
+#
+# Flags:
+#   --task-id <id>       writes the receipt under data/<id>/receipt.diff;
+#                        when omitted, the script skips the receipt step
+#                        and behaves as a pure outbox submitter.
+#   --worktree <path>    worktree root used for merge-base + diff
+#                        computation; default is pwd. Must be inside a
+#                        git working tree that can resolve origin/main
+#                        (or local main).
+#   --corr <id>          correlation id for the submission row.
+#   --reply-to-seq <n>   integer seq the row replies to.
+#   --artifact <path>    report artifact under FM_HOME/data/.
+#   --help | -h          print this header and exit 0.
+#
+# Outputs (stdout):
+#   The captain-outbox JSON row that was appended (or the duplicate row
+#   when an idempotent match was found).
+#
+# Side effects:
+#   data/<task-id>/receipt.diff    consolidated diff when --task-id is set
+#   state/captain-outbox.jsonl     submission row (idempotent)
+#   best-effort fm-captain-push    network push; outbox remains truth
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+
+usage() {
+  awk '
+    NR == 1 { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
 
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${STATE:-$FM_HOME/state}"
@@ -20,8 +71,12 @@ mkdir -p "$STATE"
 CORR=
 REPLY_TO_SEQ=
 ARTIFACT=
+TASK_ID=
+WORKTREE="$(pwd)"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --task-id) TASK_ID="${2:-}"; shift 2 ;;
+    --worktree) WORKTREE="${2:-}"; shift 2 ;;
     --corr) CORR="${2:-}"; shift 2 ;;
     --reply-to-seq) REPLY_TO_SEQ="${2:-}"; shift 2 ;;
     --artifact) ARTIFACT="${2:-}"; shift 2 ;;
@@ -49,6 +104,32 @@ case "$ART_PATH" in
   "$DATA_ROOT"/*) ;;
   *) echo "fm-review-submit: artifact must be under $DATA_ROOT" >&2; exit 3 ;;
 esac
+
+# When --task-id is supplied, write the consolidated diff receipt BEFORE
+# the JSONL append + push (the submit step). A network 429 on the push
+# must not lose the work record, so the receipt lands first.
+if [ -n "$TASK_ID" ]; then
+  [ -d "$WORKTREE" ] || { echo "fm-review-submit: --worktree not a directory: $WORKTREE" >&2; exit 3; }
+  command -v git >/dev/null 2>&1 || { echo "fm-review-submit: git not on PATH" >&2; exit 3; }
+  git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "fm-review-submit: --worktree is not a git repo: $WORKTREE" >&2
+    exit 3
+  }
+  BASE_SHA="$(git -C "$WORKTREE" merge-base HEAD origin/main 2>/dev/null \
+    || git -C "$WORKTREE" merge-base HEAD main 2>/dev/null \
+    || true)"
+  [ -n "$BASE_SHA" ] || {
+    echo "fm-review-submit: cannot compute merge-base against origin/main or main in $WORKTREE" >&2
+    exit 3
+  }
+  RECEIPT_DIR="$DATA_ROOT/$TASK_ID"
+  RECEIPT_PATH="$RECEIPT_DIR/receipt.diff"
+  mkdir -p "$RECEIPT_DIR"
+  if ! git -C "$WORKTREE" diff "$BASE_SHA" HEAD > "$RECEIPT_PATH" 2>/dev/null; then
+    echo "fm-review-submit: failed to write receipt.diff at $RECEIPT_PATH" >&2
+    exit 3
+  fi
+fi
 
 HASH="$(sha256sum "$ART_PATH" | awk '{print $1}')"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
