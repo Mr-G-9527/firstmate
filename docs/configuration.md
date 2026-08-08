@@ -278,6 +278,44 @@ Malformed JSON, an empty or malformed rule/default array, an unverified harness,
 While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Dispatch wave sizing
+
+`bin/fm-spawn.sh` accepts multiple `id=repo` pairs in one invocation and re-execs itself for each pair, so the dispatcher's effective concurrency is bounded by the size of the wave the caller assembles. A raw wave ignores measured provider capacity: a caller asking for ten parallel minimax-routed workers against a near-empty window is the exact over-dispatch that 429s later, so firstmate exposes an opt-in pre-flight that reads headroom once before admitting any worker and caps the wave at the floor of (requested pairs × headroom_pct / 100).
+
+The minimax provider is the supported scope of this pre-flight. `quota-axi` does not model it (verified 2026-08-08; see `bin/fm-quota-axi-lib.sh` and `docs/verification/dispatch-auth.md`) and the `api.minimaxi.com/anthropic` endpoint does not emit `x-ratelimit-*` headers on either `/v1/models` or `/v1/messages` responses (same verification), so the pre-flight uses one of two methods:
+
+1. `--method=api` (default off, opt-in) - authenticated GET against the configured endpoint. Captures `x-ratelimit-remaining-*` / `x-ratelimit-reset-*` headers when a future provider release exposes them and reports `remaining_quota` plus a normalised `reset_at`. Fails loud (exit 2 unreachable, exit 3 non-success) so a missing endpoint never silently degrades into assumed headroom.
+2. `--method=history` (default) - reads the home's `state/<id>.status` files plus the durable wake-queue tail, counts 429 events within the trailing `--window` (default 15 minutes, hard bounds 60s to 24h), and translates the error rate into `headroom_pct = 100 − (429_count / total_count) × 100`. Fails loud (exit 2) when the most recent event is older than twice the window, so a home with no recent activity never admits a wave against unknown headroom.
+
+The helper at `bin/fm-minimax-quota.sh` is a fact collector and never a router: it returns a JSON object on stdout and lets the dispatcher own the sizing call. The JSON shape is fixed across both methods so a future method can be added without touching the dispatcher.
+
+### Enabling the pre-flight
+
+The pre-flight is opt-in so existing batch dispatches keep their current behaviour. Enable it for one invocation with `FM_MINIMAX_QUOTA_PREFLIGHT=1` in the environment, or for every invocation in a home by writing the literal `on` to `config/minimax-quota-preflight`:
+
+```sh
+echo on > config/minimax-quota-preflight
+```
+
+The dispatcher runs the pre-flight before the batch loop on every enabled invocation. A stale or unreachable pre-flight refuses the wave with a single loud error line:
+
+```
+error: minimax quota pre-flight returned no usable headroom (rc=2, method=history); refusing the wave to avoid admitting workers against unknown capacity. Re-run with FM_MINIMAX_QUOTA_PREFLIGHT=0 to bypass.
+```
+
+When headroom is returned, the dispatcher prints one `notice:` line summarising the measurement and the resulting wave size, then caps the loop at the computed number of pairs. Pairs past the cap are deferred with a `notice:` line and exit code 2 so the caller knows the wave did not land them all; re-dispatch in a follow-up batch to land the remainder.
+
+### Operator workflow
+
+- Default-off keeps every existing dispatch path unchanged, so a fresh home or one not using minimax has nothing to enable.
+- A home routed only through minimax should turn it on so a wave can never outrun measured capacity; `config/minimax-quota-preflight` is the durable lever.
+- A mixed-provider home that runs minimax sometimes should keep it on, because the pre-flight is cheap (a single file scan against the local state directory) and refuses the wave cleanly when the minimax evidence is missing rather than degrading silently.
+- The pre-flight reads local state only, so it is safe to enable in any secondmate that also runs minimax-routed workers; secondmates inherit `config/minimax-quota-preflight` from the primary through the inherited-local-material path described in [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md).
+
+### Future extensions
+
+A second method that probes a vendor-published quota endpoint should be added as a third `--method=` value rather than by replacing the history default, because the history method is the one path that works without depending on undocumented vendor headers. The JSON output schema is the contract; new methods must populate the same keys.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.

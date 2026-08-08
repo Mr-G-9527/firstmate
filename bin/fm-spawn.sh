@@ -753,11 +753,39 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   # spanning several modes is two invocations rather than a silent mixed dispatch.
   [ "$MODE_SET" -eq 0 ] || shared_args+=(--mode "$MODE")
   [ "$YOLO_SET" -eq 0 ] || shared_args+=(--yolo "$YOLO")
+  # Quota pre-flight: opt-in via FM_MINIMAX_QUOTA_PREFLIGHT=1 or
+  # config/minimax-quota-preflight. When on, the dispatcher probes measured
+  # provider headroom once before admitting any worker and caps the wave at
+  # the floor of (requested pairs * headroom_pct / 100). Stale or unreachable
+  # data fails loud so a wave never launches against unknown headroom.
+  # docs/configuration.md "Dispatch wave sizing" owns the operator contract.
+  BATCH_TOTAL=${#POS[@]}
+  BATCH_EFFECTIVE=$BATCH_TOTAL
+  if [ "${FM_MINIMAX_QUOTA_PREFLIGHT:-0}" = 1 ] \
+     || [ -f "$CONFIG/minimax-quota-preflight" ] && grep -qxF on "$CONFIG/minimax-quota-preflight" 2>/dev/null; then
+    if [ -x "$FM_ROOT/bin/fm-minimax-quota.sh" ]; then
+      preflight_json=$("$FM_ROOT/bin/fm-minimax-quota.sh" --method=history 2>/dev/null) || preflight_rc=$?
+      preflight_rc=${preflight_rc:-0}
+      preflight_headroom=$(printf '%s\n' "$preflight_json" | jq -r '.headroom_pct // empty' 2>/dev/null || true)
+      if [ "$preflight_rc" -ne 0 ] || [ -z "$preflight_headroom" ] || [ "$preflight_headroom" = null ]; then
+        echo "error: minimax quota pre-flight returned no usable headroom (rc=$preflight_rc, method=history); refusing the wave to avoid admitting workers against unknown capacity. Re-run with FM_MINIMAX_QUOTA_PREFLIGHT=0 to bypass." >&2
+        exit 1
+      fi
+      BATCH_EFFECTIVE=$(awk -v total="$BATCH_TOTAL" -v pct="$preflight_headroom" 'BEGIN { n = int((total * pct) / 100); if (n < 0) n = 0; if (n > total) n = total; print n }')
+      echo "notice: minimax quota pre-flight measured headroom=${preflight_headroom}% over $(jq -r '.data_window_seconds // "?"' <<<"$preflight_json" 2>/dev/null)s; sizing wave from $BATCH_TOTAL requested pairs to $BATCH_EFFECTIVE admitted pairs" >&2
+    fi
+  fi
+  admitted=0
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
       *) echo "error: batch dispatch expects every argument as id=repo; got '$pair'" >&2; rc=2; continue ;;
     esac
+    if [ "$admitted" -ge "$BATCH_EFFECTIVE" ]; then
+      echo "notice: deferring batch pair ${pair%%=*}=${pair#*=} past the pre-flight-sized wave (admitted=$admitted of $BATCH_EFFECTIVE); re-dispatch in a follow-up batch to land it" >&2
+      rc=2
+      continue
+    fi
     if [ "$KIND" = secondmate ]; then
       echo "error: batch dispatch does not support --secondmate; spawn each secondmate explicitly" >&2
       rc=2
@@ -767,6 +795,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
     else
       if FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair%%=*}" "${pair#*=}" "${shared_args[@]+"${shared_args[@]}"}"; then :; else echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2; rc=1; fi
     fi
+    admitted=$((admitted + 1))
   done
   exit "$rc"
 fi
