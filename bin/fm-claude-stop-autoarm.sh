@@ -164,7 +164,14 @@ while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
 
   ACTIONABLE=0
   if [ -n "$OUT" ]; then
-    grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" 2>/dev/null && ACTIONABLE=1
+    # Mirror bin/fm-watch-arm.sh watch_output_has_wake: inbox-drain is an
+    # actionable wake prefix the watcher/auto-drain path can produce, so the
+    # arm script prints it but this loop must also recognize it. Without it,
+    # a clean inbox-drain close fails the post-loop actionable check and the
+    # next loop iteration's healthy-watcher probe (the watcher just exited),
+    # so the bounded 2-attempt loop converges to the FAILED notice path even
+    # though the watcher delivered its wake and rewake is the right outcome.
+    grep -Eq '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$OUT" 2>/dev/null && ACTIONABLE=1
   fi
   [ "$ACTIONABLE" -eq 1 ] && break
 
@@ -211,7 +218,7 @@ if [ "$ACTIONABLE" -eq 1 ]; then
   write_epoch rewake
   {
     printf 'firstmate watcher wake - one supervision event needs a handling turn now.\n'
-    [ -n "$OUT" ] && grep -E '^(signal:|stale:|check:|heartbeat)' "$OUT" 2>/dev/null | head -8
+    [ -n "$OUT" ] && grep -E '^(signal:|stale:|check:|heartbeat|inbox-drain)' "$OUT" 2>/dev/null | head -8
     printf 'Run bin/fm-wake-drain.sh first and handle the wake. This Stop hook owns watcher continuity: when the handling turn ends, the next needed cycle arms automatically - do NOT run bin/fm-watch-arm.sh after an ordinary wake.\n'
   } >&2
   [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
