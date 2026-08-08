@@ -2,7 +2,7 @@
 description: Drain firstmate wake queue + captain inbox, handle captain messages
 ---
 
-Run `bash bin/fm-captain-wake-drain.sh`. This drains the firstmate wake queue and any pending captain inbox messages, printing them to stdout.
+Run `bash bin/fm-captain-wake-drain.sh && bash bin/fm-wake-drain.sh`. This drains the firstmate wake queue and any pending captain inbox messages, printing them to stdout.
 
 Handle any `=== FIRSTMATE CAPTAIN INPUT v1 corr=<corr> kind=<kind> seq=<seq> ===` blocks surfaced as captain instructions:
 - Read the `corr` / `kind` / `seq` header.
