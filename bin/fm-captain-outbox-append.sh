@@ -30,10 +30,18 @@
 #   --json '<row-json>'  full prebuilt JSON object (overrides --text/--state/--kind/--seq)
 #   --ts '<iso8601>'     optional timestamp override (default: now UTC)
 #   --outbox '<path>'    optional outbox path override (default: $STATE/captain-outbox.jsonl)
+#   --idempotent         if a row already exists with the same corr and kind,
+#                        echo the existing row and skip the append. The check
+#                        runs under the same flock as the append so two
+#                        concurrent callers cannot both insert a duplicate.
+#                        Use this when the row represents a one-shot terminal
+#                        event (for example a per-task done receipt).
 #
 # Output:
-#   stdout: the row that was appended (single newline-terminated JSON line).
-#   exit 0: appended; non-zero: rejected (multi-line body, invalid JSON, etc).
+#   stdout: the row that was appended (or the existing row when --idempotent
+#           matched; single newline-terminated JSON line either way).
+#   exit 0: appended or matched an existing idempotent row.
+#   non-zero: rejected (multi-line body, invalid JSON, etc).
 #
 # Mode 0700 because the file path is captain-private and the outbox is
 # adjacent to other state-secret material.
@@ -55,6 +63,7 @@ TEXT=
 SEQ=
 KIND=chat
 JSON_BODY=
+IDEMPOTENT=0
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,6 +75,7 @@ while [ $# -gt 0 ]; do
     --json) JSON_BODY="${2:-}"; shift 2 ;;
     --ts) TS="${2:-}"; shift 2 ;;
     --outbox) OUTBOX="${2:-}"; shift 2 ;;
+    --idempotent) IDEMPOTENT=1; shift ;;
     --) shift; break ;;
     *) echo "fm-captain-outbox-append: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -118,6 +128,20 @@ fi
 # state/.captain-outbox.lock - same as bin/fm-review-submit.sh.
 exec 9>"$LOCK"
 flock 9
+if [ "$IDEMPOTENT" = "1" ]; then
+  ROW_CORR_VALUE="$(printf '%s' "$ROW" | jq -r '.corr // empty')"
+  ROW_KIND_VALUE="$(printf '%s' "$ROW" | jq -r '.kind // empty')"
+  if [ -n "$ROW_CORR_VALUE" ] && [ -n "$ROW_KIND_VALUE" ] && [ -f "$OUTBOX" ]; then
+    DUP="$(jq -c --arg corr "$ROW_CORR_VALUE" --arg kind "$ROW_KIND_VALUE" \
+      'select(.corr==$corr and .kind==$kind)' \
+      "$OUTBOX" 2>/dev/null | head -n1 || true)"
+    if [ -n "$DUP" ]; then
+      flock -u 9
+      printf '%s\n' "$DUP"
+      exit 0
+    fi
+  fi
+fi
 printf '%s\n' "$ROW" >> "$OUTBOX"
 flock -u 9
 

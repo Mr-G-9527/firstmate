@@ -42,6 +42,12 @@
 # Side effects:
 #   data/<task-id>/receipt.diff    consolidated diff when --task-id is set
 #   state/captain-outbox.jsonl     submission row (idempotent)
+#   state/captain-outbox.jsonl     per-task done row (idempotent) when
+#                                  --task-id is set; emitted via
+#                                  bin/fm-task-done.sh so the captain
+#                                  monitor never misses a completion
+#                                  that the worker only knew as "call
+#                                  the submit helper" (puti 监控漏 fix)
 #   best-effort fm-captain-push    network push; outbox remains truth
 set -eu
 
@@ -166,3 +172,23 @@ fi
 
 flock -u 9
 echo "$ROW"
+
+# Per-task done emit. The captain monitor reads the outbox for per-task
+# completion; without this row a worker that only knows the canonical
+# submit helper would still need a separate chat append to surface its
+# `done:` event, which is the puti 监控漏 gap. The emit is best-effort:
+# the report-submission row above is the contract and remains on disk
+# even if this auxiliary call fails. The warning goes to stderr so the
+# worker sees it, but the script's exit code reflects the primary row.
+# The artifact forwarded to fm-task-done.sh is the report the worker
+# submitted, not the receipt.diff fm-review-submit wrote: a fresh
+# worktree can have an empty diff against the merge-base, and the
+# report is the actual reviewable deliverable anyway.
+if [ -n "$TASK_ID" ] && [ -x "$SCRIPT_DIR/fm-task-done.sh" ]; then
+  if ! "$SCRIPT_DIR/fm-task-done.sh" \
+      --task-id "$TASK_ID" \
+      --corr "$CORR" \
+      --artifact "$ART_PATH" >/dev/null; then
+    echo "fm-review-submit: per-task done emit failed (task-done.sh exit); report-submission row still landed" >&2
+  fi
+fi
