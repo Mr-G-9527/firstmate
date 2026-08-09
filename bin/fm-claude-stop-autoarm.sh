@@ -70,6 +70,20 @@ case "$AUTOARM_ATTEMPTS" in
   *) AUTOARM_ATTEMPTS=2 ;;
 esac
 
+# Actionable wake-prefix family. This is the SINGLE source of truth for what
+# counts as an actionable reason line, and it is shared verbatim with
+# bin/fm-watch-arm.sh's `watch_output_has_wake` / `watch_output_reason_type`
+# helpers (the arm script classifies the same wake output from the child
+# watcher). The script-local banner-extraction regex on the rewake banner
+# (a few hundred lines below) and the failure-notice regex intentionally
+# differ - they extract a wider set of arm-output lines for display, so they
+# stay inline with an explanatory comment. Update BOTH the auto-arm script
+# AND the watch-arm script if a new wake prefix is added, or the actionable
+# check will silently miss it and the bounded retry will emit a "watcher
+# auto-arm FAILED" notice for an actually-actionable wake (the exact
+# failure mode the captain chased at 2026-08-09 ~23:00).
+FM_AUTOARM_WAKE_PATTERN='^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )'
+
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
@@ -171,7 +185,7 @@ while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
     # next loop iteration's healthy-watcher probe (the watcher just exited),
     # so the bounded 2-attempt loop converges to the FAILED notice path even
     # though the watcher delivered its wake and rewake is the right outcome.
-    grep -Eq '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$OUT" 2>/dev/null && ACTIONABLE=1
+    grep -Eq "$FM_AUTOARM_WAKE_PATTERN" "$OUT" 2>/dev/null && ACTIONABLE=1
   fi
   [ "$ACTIONABLE" -eq 1 ] && break
 
@@ -218,6 +232,12 @@ if [ "$ACTIONABLE" -eq 1 ]; then
   write_epoch rewake
   {
     printf 'firstmate watcher wake - one supervision event needs a handling turn now.\n'
+    # Banner extraction uses a slightly wider pattern than the actionable
+    # check: it just prints whatever wake-shaped lines are present so the
+    # operator sees the rendered reason without caring about the precise
+    # classification. Keeping this inline (not via the FM_AUTOARM_WAKE_PATTERN
+    # variable) is intentional - the actionable check is the strict gate,
+    # banner extraction is the operator display.
     [ -n "$OUT" ] && grep -E '^(signal:|stale:|check:|heartbeat|inbox-drain)' "$OUT" 2>/dev/null | head -8
     printf 'Run bin/fm-wake-drain.sh first and handle the wake. This Stop hook owns watcher continuity: when the handling turn ends, the next needed cycle arms automatically - do NOT run bin/fm-watch-arm.sh after an ordinary wake.\n'
   } >&2
@@ -232,6 +252,11 @@ if [ ! -e "$FAILURE_NOTICE" ]; then
   write_epoch failed
   {
     printf 'firstmate watcher auto-arm FAILED - the Stop-owned automatic supervision mechanism is broken after %s bounded attempts, and no live watcher with a fresh beacon was verified.\n' "$attempt"
+    # Failure-notice extraction is the operator diagnostic format, so it
+    # also pulls the arm script's own status lines (e.g. `watcher: started ...`,
+    # `watcher: FAILED - ...`); those are the most informative lines when the
+    # boundary itself fails. The wake prefix list matches FM_AUTOARM_WAKE_PATTERN
+    # but adds `watcher:` for arm status.
     [ -n "$OUT" ] && grep -E '^(watcher:|signal:|stale:|check:|heartbeat)' "$OUT" 2>/dev/null | head -8
     printf 'Do not launch a manual background arm from this notice; investigate the automatic Stop hook and watcher startup before ending blind.\n'
   } >&2

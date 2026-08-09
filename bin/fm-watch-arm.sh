@@ -87,6 +87,16 @@ ARM_PID=${BASHPID:-$$}
 case "$CYCLE_LOG_MAX_BYTES" in ''|*[!0-9]*|0) CYCLE_LOG_MAX_BYTES=262144 ;; esac
 case "$CYCLE_LOG_KEEP_LINES" in ''|*[!0-9]*|0) CYCLE_LOG_KEEP_LINES=1000 ;; esac
 
+# Actionable wake-prefix family. The SINGLE source of truth for what counts
+# as an actionable reason line is mirrored in bin/fm-claude-stop-autoarm.sh
+# under the same name (FM_AUTOARM_WAKE_PATTERN). Keep them in lockstep: the
+# arm script classifies the same wake output and must agree on every prefix,
+# otherwise the file-level regex the Stop hook tests can disagree with the
+# line-level regex the arm script classifies, and one side silently misses a
+# wake the other surfaces (the exact failure mode the captain chased at
+# 2026-08-09 ~23:00).
+FM_AUTOARM_WAKE_PATTERN='^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )'
+
 # The lifecycle ledger is diagnostic evidence, not a supervision dependency.
 # Writes are bounded and best-effort so an observability failure cannot stall an
 # otherwise healthy watcher cycle.
@@ -355,12 +365,12 @@ watch_output_has_wake() {
   # P2 (2026-08-04 live-fix): include inbox-drain as an actionable wake
   # prefix so the hook rewakes Claude when the watcher's auto-drain path
   # produced a payload (chat blocks + dispatch markers, even on rc=1).
-  grep -Eq '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$out" 2>/dev/null
+  grep -Eq "$FM_AUTOARM_WAKE_PATTERN" "$out" 2>/dev/null
 }
 
 watch_output_reason_type() {
   local out=$1 line
-  line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:)|inbox-drain )' "$out" 2>/dev/null | head -1 || true)
+  line=$(grep -E "$FM_AUTOARM_WAKE_PATTERN" "$out" 2>/dev/null | head -1 || true)
   case "$line" in
     signal:*) printf 'actionable-signal' ;;
     stale:*) printf 'actionable-stale' ;;
