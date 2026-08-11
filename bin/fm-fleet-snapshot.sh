@@ -608,15 +608,20 @@ task_json_lines() {
 # Meta inventory remains the sole source of live workers; this object only
 # discloses backlog↔task inconsistency for renderers (Bearings omitted/gates).
 main_inventory_json() {  # <backlog-json> <tasks-json>
+  # Payload-passing convention: bind the two fleet-scale JSON documents via
+  # --slurpfile from process substitution rather than --argjson. A single argv
+  # entry is capped by Linux MAX_ARG_STRLEN (131072 bytes), and either backlog
+  # or tasks alone crosses that above ~50 tasks; see the scale regression test
+  # in tests/fm-fleet-snapshot-view.test.sh for the proof.
   jq -n \
-    --argjson backlog "$1" \
-    --argjson tasks "$2" '
-    ([ $backlog.records[]?
+    --slurpfile backlog <(printf '%s' "$1") \
+    --slurpfile tasks <(printf '%s' "$2") '
+    ([ $backlog[0].records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
-    | ([ $backlog.records[]?
+    | ([ $backlog[0].records[]?
          | select(.state == "in_flight" and .structured and .requires_child_metadata) ]) as $owned_in_flight
     | ([ $owned_in_flight[]
-         | select(.id as $id | [$tasks[].id] | index($id) | not)
+         | select(.id as $id | [$tasks[0][].id] | index($id) | not)
          | .id ]) as $orphan_in_flight
     | (($unstructured_current | length) == 0
        and ($orphan_in_flight | length) == 0) as $valid
@@ -636,6 +641,9 @@ main_inventory_json() {  # <backlog-json> <tasks-json>
 # This mode never reads parent events or terminal text and never aggregates
 # nested secondmates.
 secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
+  # Payload-passing convention: see main_inventory_json above. Same argv-cap
+  # hazard for backlog/tasks at fleet scale; the same --slurpfile binding fixes
+  # it. The non-payload args stay on --arg/--argjson since they are tiny.
   jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --arg home "$FM_HOME" \
@@ -643,42 +651,42 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
     --argjson queued_n "$FM_SNAPSHOT_SECONDMATE_QUEUED" \
     --argjson decisions_n "$FM_SNAPSHOT_SECONDMATE_DECISIONS" \
     --argjson landed_n "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" \
-    --argjson backlog "$1" \
-    --argjson tasks "$2" '
+    --slurpfile backlog <(printf '%s' "$1") \
+    --slurpfile tasks <(printf '%s' "$2") '
     def trunc($n):
       tostring | gsub("\\s+"; " ")
       | if length > $n then .[:$n] + "…" else . end;
-    ([ $backlog.records[]?
+    ([ $backlog[0].records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
-    | ([ $backlog.records[]? | select(.state == "in_flight" and .structured) ]) as $owned_in_flight
-    | ([ $backlog.records[]?
+    | ([ $backlog[0].records[]? | select(.state == "in_flight" and .structured) ]) as $owned_in_flight
+    | ([ $backlog[0].records[]?
          | select(.structured and
              (.state == "queued" or
               (.state == "in_flight" and .current_role == "held"
                and (.id as $id
-                    | any($tasks[]; .id == $id and .current_state.state == "working") | not)))) ]) as $queued_all
+                    | any($tasks[0][]; .id == $id and .current_state.state == "working") | not)))) ]) as $queued_all
     | ([ $queued_all[]
          | select(.captain_actionable == true)
          | {id,key:.id,verb:"captain-hold",summary:(.title | trunc(160)),
             reason:(.hold_reason | trunc(160)),source:"backlog"} ]) as $captain_holds_all
-    | ([ $backlog.records[]? | select(.state == "done" and .structured and .kind != "captain")
+    | ([ $backlog[0].records[]? | select(.state == "done" and .structured and .kind != "captain")
          | {id:(.id | trunc(120)),title:(.title | trunc(120)),
             pr_url:((.pr_url // null) | if . == null then null else trunc(500) end),
             report_path:((.report_path // null) | if . == null then null else trunc(500) end),
             local_note:((.local_note // null) | if . == null then null else trunc(120) end),completion} ]
        | sort_by([(.completion.date // ""), .id]) | reverse) as $landed_all
-    | ([ $tasks[] | select(.current_state.state == "unknown") ]) as $unknown_children
+    | ([ $tasks[0][] | select(.current_state.state == "unknown") ]) as $unknown_children
     | ([ $owned_in_flight[]
          | select(.requires_child_metadata)
-         | select(.id as $id | [$tasks[].id] | index($id) | not) ]) as $orphan_in_flight
-    | ([ $tasks[]
+         | select(.id as $id | [$tasks[0][].id] | index($id) | not) ]) as $orphan_in_flight
+    | ([ $tasks[0][]
          | select(.id as $id | [$owned_in_flight[].id] | index($id) | not)
          | {id,state:.current_state.state} ]) as $unowned_children
     | ([ $owned_in_flight[] as $work
-         | $tasks[]
+         | $tasks[0][]
          | select(.id == $work.id and (.current_state.state == "done" or .current_state.state == "failed"))
          | {id,state:.current_state.state} ]) as $terminal_in_flight
-    | ([if $backlog.present != true then
+    | ([if $backlog[0].present != true then
           {kind:"missing_backlog",ids:[],reason:"missing structured backlog"}
         else empty end,
         if ($unstructured_current | length) > 0 then
@@ -1114,28 +1122,38 @@ secondmate_current_json() {  # <parent-tasks-json>
   local tasks=$1 registry union rows total_registered total shown truncated
   local row id home host remote registered registry_error task status_file event_raw event_note event_epoch event_age
   local activity_scan activities decisions reconciliation provenance freshness reason summary summary_rc summary_bytes summary_valid summary_reason summary_invalidity state current_reason terminal terminal_contradiction contradiction
-  local records='[]' seen_homes=''
+  local records_tmp seen_homes='' result rc
   registry=$(registry_secondmates_json) || return 1
-  union=$(jq -n --argjson registry "$registry" --argjson tasks "$tasks" '
-    ($registry.records // []) as $registered
+  # Payload-passing convention: see main_inventory_json. `tasks` alone is the
+  # fleet TASKS_JSON which crosses MAX_ARG_STRLEN above ~50 tasks.
+  union=$(jq -n --slurpfile registry <(printf '%s' "$registry") --slurpfile tasks <(printf '%s' "$tasks") '
+    ($registry[0].records // []) as $registered
     | (($registered | map(.id)) // []) as $registered_ids
     | ([ $registered[] as $r
-         | $r + {parent_task:([$tasks[] | select(.id == $r.id)][0] // null)} ]
-       + [ $tasks[] | select(.kind == "secondmate") as $t
+         | $r + {parent_task:([$tasks[0][] | select(.id == $r.id)][0] // null)} ]
+       + [ $tasks[0][] | select(.kind == "secondmate") as $t
            | select(($registered_ids | index($t.id)) == null)
            | {id:$t.id,home:($t.paths.home.path // null),
-              registered:(if $registry.complete == true then false else null end),
-              registry_error:(if $registry.complete == true
+              registered:(if $registry[0].complete == true then false else null end),
+              registry_error:(if $registry[0].complete == true
                               then "secondmate metadata is not registered"
                               else "secondmate registration is unknown because the registry read is incomplete or unavailable" end),
               parent_task:$t} ])
     | sort_by(.id)
-    | {registry:$registry,records:.}') || return 1
+    | {registry:$registry[0],records:.}') || return 1
   total_registered=$(printf '%s' "$union" | jq '[.records[] | select(.registered)] | length')
   total=$(printf '%s' "$union" | jq '.records | length')
   rows=$(printf '%s' "$union" | jq -c --argjson cap "$FM_SNAPSHOT_SECONDMATES" '(if $cap == 0 then .records else .records[:$cap] end)[]')
   shown=$(printf '%s\n' "$rows" | grep -c . || true)
   truncated=$((total - shown))
+
+  # Streaming record accumulator. The previous implementation re-passed the
+  # whole growing records array on argv every loop iteration via jq's --argjson,
+  # which made record assembly O(n^2) in argv bytes and crossed MAX_ARG_STRLEN
+  # long before the final assembly at site 5. Append one JSON record per line
+  # to a temp file and slurp the file once at the end.
+  records_tmp=$(mktemp) || return 1
+  : > "$records_tmp"
 
   while IFS= read -r row; do
     [ -n "$row" ] || continue
@@ -1298,18 +1316,25 @@ secondmate_current_json() {  # <parent-tasks-json>
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan},
          terminal_evidence:$terminal,contradiction:false}')
     fi
-    records=$(jq -n --argjson records "$records" --argjson record "$record" '$records + [$record]')
+    printf '%s\n' "$record" >> "$records_tmp" || return 1
   done <<EOF
 $rows
 EOF
-  jq -n \
+  # Payload-passing convention: see main_inventory_json. The accumulated
+  # records live in a temp file (one record per line); slurpfile wraps them
+  # as the records array directly, no O(n^2) re-pass on argv.
+  result=$(jq -n \
     --argjson registry "$(printf '%s' "$union" | jq '.registry')" \
-    --argjson records "$records" \
+    --slurpfile records "$records_tmp" \
     --argjson total_registered "$total_registered" \
     --argjson total "$total" \
     --argjson shown "$shown" \
     --argjson truncated "$truncated" \
-    '{registry:$registry,records:$records,total_registered:$total_registered,total:$total,shown:$shown,truncated:$truncated}'
+    '{registry:$registry,records:$records,total_registered:$total_registered,total:$total,shown:$shown,truncated:$truncated}')
+  rc=$?
+  rm -f "$records_tmp"
+  printf '%s' "$result"
+  return $rc
 }
 
 secondmate_landed_from_current_json() {  # <secondmate-current-json>
@@ -1370,22 +1395,22 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  --argjson backlog "$BACKLOG_JSON" \
-  --argjson tasks "$TASKS_JSON" \
+  --slurpfile backlog <(printf '%s' "$BACKLOG_JSON") \
+  --slurpfile tasks <(printf '%s' "$TASKS_JSON") \
   --argjson main_inventory "$MAIN_INVENTORY_JSON" \
   --argjson scout_reports "$SCOUT_REPORTS_JSON" \
   --argjson secondmate_current "$SECONDMATE_CURRENT_JSON" \
   --argjson secondmate_landed "$SECONDMATE_LANDED_JSON" \
-  'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
-   def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
+  'def backlog_by_id($id): ($backlog[0].records[]? | select(.structured == true and .id == $id) | .) // null;
+   def task_by_id($id): ($tasks[0][]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
    {
      schema:"fm-fleet-snapshot.v1",
      generated:$generated,
      fm_home:$fm_home,
      roots:{fm_root:$fm_root,state:$state,data:$data,config:$config,projects:$projects},
-     backlog:$backlog,
-     tasks:($tasks | map(. + {backlog:backlog_by_id(.id)})),
+     backlog:$backlog[0],
+     tasks:($tasks[0] | map(. + {backlog:backlog_by_id(.id)})),
      main_inventory:$main_inventory,
      scout_reports:($scout_reports | map(. + {kind:report_kind(.id)})),
      secondmate_current:$secondmate_current,

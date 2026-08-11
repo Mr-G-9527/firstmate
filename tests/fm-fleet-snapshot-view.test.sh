@@ -779,6 +779,50 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+# Scale regression: a fleet above ~50 tasks used to push TASKS_JSON past Linux
+# MAX_ARG_STRLEN (131072 bytes per argv entry), which made bin/fm-fleet-snapshot.sh
+# exit rc=1 with zero stdout. The fix binds fleet-scale JSON via --slurpfile /
+# temp files; this test synthesizes 200 tasks so the constructed TASKS_JSON is
+# well over the argv cap, then asserts rc=0 and the v1 schema. Behavior-only -
+# the assertion runs against the executable's stdout, never against the script
+# source. See data/scout-2026-08-11-self-scaffolding/report.md section 1.2 / 1.3
+# for the measured threshold and the six converted sites.
+test_snapshot_json_at_scale_200_tasks() {
+  local home fakebin out rc n=200 i
+  home=$(make_home scale-200)
+  mkdir -p "$home/projects/scale"
+  {
+    printf '## In flight\n'
+    for i in $(seq 1 "$n"); do
+      printf -- '- [ ] scale-%03d - Scale Task %d (repo: alpha) (kind: ship) (since 2026-08-11)\n' "$i" "$i"
+    done
+    printf '## Queued\n## Done\n'
+  } > "$home/data/backlog.md"
+  for i in $(seq 1 "$n"); do
+    fm_write_meta "$home/state/scale-$(printf '%03d' "$i").meta" \
+      "window=firstmate:fm-scale-$(printf '%03d' "$i")" \
+      "worktree=$home/projects/scale" \
+      "project=alpha" \
+      "harness=codex" \
+      "kind=ship" \
+      "mode=ship"
+    printf 'working: task %d in progress\n' "$i" > "$home/state/scale-$(printf '%03d' "$i").status"
+  done
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  rc=$?
+  [ "$rc" = "0" ] || fail "snapshot at 200 tasks must exit 0, got rc=$rc"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and (.tasks | length) == '"$n"'
+      and (.backlog.records | length) >= '"$n"'
+      and .main_inventory.valid == true
+      and .main_inventory.orphan_in_flight == []
+      and .main_inventory.unstructured_current_count == 0
+  ' >/dev/null || fail "snapshot at 200 tasks did not return the v1 schema or its inventory gates"
+  pass "snapshot at 200 tasks returns rc=0 with the fm-fleet-snapshot.v1 schema and clean inventory"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
@@ -794,3 +838,4 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_snapshot_json_at_scale_200_tasks
