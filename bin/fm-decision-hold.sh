@@ -24,6 +24,29 @@
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#   fm-decision-hold.sh list [--all | --by-key <key> | --by-origin <origin>] [--json]
+#
+# `list` prints the open-decision inventory with one row per captain-held
+# decision. Each row carries the full AXI #9 context (id, origin, state, age,
+# why-now episode, dependency, what unlocks, hold_reason summary) so a reader
+# does not have to chase downstream sources to understand each entry.
+# `--by-key <key>` filters by decision-key slug; `--by-origin <origin>` filters
+# by owning task-id; `--all` (the default when no filter is given) shows every
+# inventoried hold across the active home. The source is the per-origin
+# `decision_keys` field of `state/<id>.meta` — the same path `verify` uses to
+# enumerate holds — so `list` cannot disagree with `complete --none`'s
+# attestation about which decisions are open.
+#
+# Exit codes (consumed by bin/fm-teardown.sh at the unresolved-decision
+# completion gate and by every other caller):
+#   0  success (hold or no-op)
+#   1  decision unverified: a captain-held backlog item is missing, the wrong
+#      kind, not held for the captain, the origin has no completed inventory,
+#      or a status-stream open decision has no captain-held inventory entry
+#   2  usage error (wrong number of arguments, unknown flag)
+#  20  tool unavailable: `tasks-axi` is missing, below the compat floor in
+#      bin/fm-tasks-axi-lib.sh, or fails to expose the `--kind captain` contract
+#      required to hold a captain decision
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
@@ -78,6 +101,19 @@ fail() {
   exit 1
 }
 
+# Distinct exit code for "the tool we need is not available" (tasks-axi is
+# missing or below the compat floor). The unresolved-decision completion gate
+# in bin/fm-teardown.sh:2320 treats rc=20 differently from a rc=1 "decision
+# unverified" failure: rc=20 means the gate is UNKNOWN (we cannot prove the
+# inventory passed) rather than "the inventory is provably absent". Refusing
+# teardown on rc=1 because we cannot find a decision when the tool is
+# unavailable conflates the two and was the wedge §1.6 of the self-scaffolding
+# report caught. Documented in this script's help text above.
+fail_tool_unavailable() {
+  printf 'fm-decision-hold: tool unavailable: %s\n' "$*" >&2
+  exit 20
+}
+
 validate_slug() {  # <label> <value>
   local label=$1 value=$2
   case "$value" in
@@ -114,9 +150,9 @@ tasks_axi() {
 }
 
 require_tasks_axi() {
-  fm_tasks_axi_compatible || fail "compatible tasks-axi is required"
+  fm_tasks_axi_compatible || fail_tool_unavailable "compatible tasks-axi is required"
   tasks-axi hold --help 2>&1 | grep -F -- '--kind captain' >/dev/null \
-    || fail "tasks-axi does not expose the captain-hold contract"
+    || fail_tool_unavailable "tasks-axi does not expose the captain-hold contract"
 }
 
 task_show() {  # <id>
@@ -141,6 +177,175 @@ list_has_key() {  # <comma-list> <key>
   esac
 }
 
+# Map a held captain decision's tasks-axi state + body to one of the three
+# fleet-visible lifecycle states:
+#   pending  - held=yes, no resolution record; awaiting captain decision
+#   routed  - held=yes AND at least one dependent task is blocked by this hold;
+#             the hold is awaiting captain decision but the work behind it is
+#             already wired up
+#   resolved - state=done AND the durable "Resolution recorded by
+#             fm-decision-hold." body marker is present; the captain decision
+#             has been recorded and the dependent work has been unblocked
+# A hold that has been resolved but lacks the durable body marker is treated
+# as "pending" with a state note rather than "resolved", because the durable
+# record is the contract the rest of the fleet reads from. Returning empty
+# here means "this id is not a captain decision at all" and the caller skips
+# the row.
+hold_lifecycle_state() {  # <hold-show>
+  local show=$1 state kind body
+  state=$(show_field "$show" state)
+  kind=$(show_field "$show" kind)
+  body=$(show_field "$show" body)
+  [ "$kind" = captain ] || return 1
+  case "$state" in
+    done)
+      case "$body" in
+        *"Resolution recorded by fm-decision-hold."*) printf 'resolved' ;;
+        *) printf 'pending' ;;
+      esac
+      ;;
+    queued) printf 'pending' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Find the line number of the first status-stream episode that surfaced the
+# decision for an origin. The precedence is:
+#   1. `needs-decision [key=<key>]: ...` in state/<origin>.status - the original
+#      surface where the decision was identified (report-derived decisions
+#      that did not come from a status line fall through to step 2)
+#   2. `captain-held [key=<key>]: ...` in state/<origin>.status - the line
+#      written after command_complete transferred the live status decision to
+#      its durable backlog owner
+#   3. data/<origin>/report.md - the report that surfaced the decision; emit
+#      a generic `<report>:1` because report files do not carry per-decision
+#      line markers
+#   4. empty - no episode located; the row shows "unknown"
+why_now_episode() {  # <origin> <key>
+  local origin=$1 key=$2 status_file report_file line ln=0
+  status_file="$STATE/$origin.status"
+  report_file="$DATA/$origin/report.md"
+  if [ -f "$status_file" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      ln=$((ln + 1))
+      case "$line" in
+        "needs-decision [key=$key]:"*|"needs-decision:"*) \
+          printf 'state/%s.status:%d' "$origin" "$ln"; return 0 ;;
+      esac
+    done < "$status_file"
+    ln=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      ln=$((ln + 1))
+      case "$line" in
+        "captain-held [key=$key]:"*|"captain-held:"*) \
+          printf 'state/%s.status:%d' "$origin" "$ln"; return 0 ;;
+      esac
+    done < "$status_file"
+  fi
+  if [ -f "$report_file" ]; then
+    printf 'data/%s/report.md:1' "$origin"
+    return 0
+  fi
+  printf 'unknown'
+}
+
+# Map a hold's tasks-axi `created` YYYY-MM-DD to "Nd" or "unknown" if the
+# field is missing or unparseable. FM_NOW_DATE pins "today" so tests can age
+# holds deterministically.
+hold_age_days() {  # <hold-show>
+  local show=$1 created cur days
+  created=$(show_field "$show" created)
+  [ -n "$created" ] || { printf 'unknown'; return; }
+  cur=$(_today_epoch_days) || { printf 'unknown'; return; }
+  days=$(_date_epoch_days "$created") || { printf 'unknown'; return; }
+  days=$((cur - days))
+  [ "$days" -ge 0 ] 2>/dev/null || { printf 'unknown'; return; }
+  printf '%dd' "$days"
+}
+
+# Find every task whose `blocked_by` carries <hold-id>. Returns one
+# "<task-id> (<state>)" pair per dependent, space-separated, in tasks-axi list
+# glob order. Empty when no dependents are registered, which the caller renders
+# as `no-block`. A dependent's state is read at list time so a row that shows
+# "task-done" reflects a follow-up that has already shipped past the hold.
+#
+# Implementation note: tasks-axi's `blocked_by` is quoted as a single CSV when
+# multi-entry ("a,b,c"); the per-task stripping is the same pattern
+# command_resolve uses, so a quoted blocked_by that lists the hold as its
+# first, middle, or last element all match. We strip the first five fixed
+# fields (id, state, kind, repo, title) before consuming blocked_by so the
+# quoted CSV in the last field stays intact, instead of splitting on every
+# comma and breaking on the inner one.
+hold_dependents() {  # <hold-id>
+  local hold_id=$1 list_output header rest tmp blocked state id trimmed
+  list_output=$(tasks_axi list --fields blocked_by 2>/dev/null) || return 0
+  # tasks-axi prints a `count: N` line ahead of the `tasks[N]{fields}:` header
+  # and a trailing `help[N]:` block; locate the header so the row-parsing
+  # loop below can be a simple line reader.
+  header=$(printf '%s\n' "$list_output" | grep -E '^tasks\[[0-9]+\]\{id,' | head -1) || return 0
+  [ -n "$header" ] || return 0
+  rest=${list_output#*$'\n'}
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      'help['*|count:*) break ;;
+    esac
+    # tasks-axi list output indents data rows with two leading spaces; trim
+    # both ends so the first-field id is the bare task slug, not "  id".
+    trimmed=$line
+    trimmed=${trimmed#"${trimmed%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    id=${trimmed%%,*}
+    # Strip the first five comma-separated fields (id,state,kind,repo,title);
+    # whatever remains is the blocked_by value, possibly quoted.
+    tmp=$trimmed
+    tmp=${tmp#*,}; tmp=${tmp#*,}; tmp=${tmp#*,}; tmp=${tmp#*,}; tmp=${tmp#*,}
+    blocked=$tmp
+    case "$blocked" in
+      '"'*'"') blocked=${blocked#\"}; blocked=${blocked%\"} ;;
+    esac
+    case ",$blocked," in
+      *,$hold_id,*) : ;;
+      *) continue ;;
+    esac
+    # State is field 2; always a simple token (queued|in_flight|done|held),
+    # so a head-of-line trim up to the next comma is sufficient.
+    state=${trimmed#*,}; state=${state%%,*}
+    [ -n "$state" ] || state=unknown
+    printf '%s(%s) ' "$id" "$state"
+  done <<EOF
+$rest
+EOF
+}
+
+# Render a single row's `<dependency>` field. Pass an empty string from
+# hold_dependents to mean "no dependents registered"; that becomes the literal
+# `no-block` so the reader can scan for unblocked holds at a glance.
+format_dependency() {  # <dependents-string>
+  local deps=${1:-}
+  if [ -z "$deps" ]; then
+    printf 'no-block'
+    return
+  fi
+  printf '%s' "${deps% }"
+}
+
+# Render a single row's `<unlocks>` field. The action is the exact
+# `command_resolve` invocation the captain runs to close the hold, and the
+# downstream list mirrors the registered dependents so the reader sees what
+# ships after the decision lands.
+format_unlocks() {  # <origin> <key> <dependents-string>
+  local origin=$1 key=$2 deps=${3:-}
+  local action="fm-decision-hold.sh resolve ${origin} ${key} --decision-file <path> --routed-to <task-id>"
+  if [ -z "$deps" ]; then
+    printf '%s + no downstream tasks currently registered' "$action"
+    return
+  fi
+  printf '%s + unblocks: %s' "$action" "${deps% }"
+}
+
 sorted_key_union() {  # <comma-list> <newline-or-space-separated-new-keys>
   local existing=$1 new=$2
   {
@@ -151,6 +356,33 @@ sorted_key_union() {  # <comma-list> <newline-or-space-separated-new-keys>
 
 meta_value() {  # <meta> <key>
   grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+# Parse a YYYY-MM-DD (or YYYY-M-D, etc.) date into days-since-epoch using
+# portable `date -d` / `date -j` for Linux and macOS respectively. Returns empty
+# on parse failure so callers can fall back to an unknown-age display.
+_date_epoch_days() {  # <date-string>
+  local d=$1 epoch
+  case "$d" in
+    '') return 1 ;;
+  esac
+  if epoch=$(date -d "$d" +%s 2>/dev/null); then :; \
+  elif epoch=$(date -j -f '%Y-%m-%d' "$d" +%s 2>/dev/null); then :; \
+  else return 1; fi
+  printf '%s' "$((epoch / 86400))"
+}
+
+# today_epoch_days: today's date (UTC) expressed as days since epoch, so the
+# age column can subtract hold-creation days without time-of-day drift. Honors
+# FM_NOW_DATE override so tests can pin "today" deterministically.
+_today_epoch_days() {
+  local now
+  if [ -n "${FM_NOW_DATE:-}" ]; then
+    _date_epoch_days "${FM_NOW_DATE%T*}" || { echo 0; return; }
+    return
+  fi
+  now=$(date -u +%Y-%m-%d)
+  _date_epoch_days "$now" || { echo 0; return; }
 }
 
 origin_open_decisions() {  # <origin-id>
@@ -481,12 +713,173 @@ command_resolve() {
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
+# Build one row of AXI #9 context for a single hold. Prints four
+# "<key>=<value>" assignments in stable order, one per line, so a JSON
+# assembler can concatenate rows with commas and the text formatter can
+# pick fields by name without positional drift. Empty keys (no dependents)
+# are emitted as their sentinel token (`no-block`) so the reader can scan
+# for unblocked holds at a glance.
+list_row_for() {  # <origin> <key> <hold-show>
+  local origin=$1 key=$2 show=$3 state dependents age why_now dep unlocks summary
+  state=$(hold_lifecycle_state "$show") || return 0
+  dependents=$(hold_dependents "$(hold_id "$origin" "$key")")
+  # "routed" means the hold has at least one dependent registered, even
+  # while still awaiting the captain decision. A pending hold with zero
+  # dependents stays "pending"; resolved stays "resolved" regardless of
+  # dependents because the durable record already closed the lifecycle.
+  if [ "$state" = pending ] && [ -n "$dependents" ]; then
+    state=routed
+  fi
+  age=$(hold_age_days "$show")
+  why_now=$(why_now_episode "$origin" "$key")
+  dep=$(format_dependency "$dependents")
+  unlocks=$(format_unlocks "$origin" "$key" "$dependents")
+  summary=$(show_field "$show" hold_reason)
+  [ -n "$summary" ] || summary='<no hold_reason recorded>'
+  printf 'id=%s\norigin=%s\nstate=%s\nage=%s\nwhy-now=%s\ndependency=%s\nunlocks=%s\nsummary=%s\n' \
+    "$(hold_id "$origin" "$key")" "$origin" "$state" "$age" "$why_now" "$dep" "$unlocks" "$summary"
+}
+
+# Emit the full `list` payload. Walks every state/<id>.meta (the same source
+# `verify` uses to enumerate holds for one origin), looks up each inventoried
+# hold via task_show, and yields AXI #9 rows. The output is sorted by
+# (origin, key) for deterministic captain-facing presentation; the JSON path
+# uses the same ordering so consumers can rely on it.
+command_list() {
+  local mode=all by_key='' by_origin='' as_json=0 meta origin keys key show
+  local rows_holder=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all) mode=all ;;
+      --by-key) shift; by_key=${1:-}; [ -n "$by_key" ] || fail "--by-key requires a value" ;;
+      --by-origin) shift; by_origin=${1:-}; [ -n "$by_origin" ] || fail "--by-origin requires a value" ;;
+      --json) as_json=1 ;;
+      *) fail "unknown list flag: $1" ;;
+    esac
+    shift
+  done
+  # Reject mutually-exclusive filter flags up front so a confused caller
+  # gets a clean diagnostic instead of one filter silently masking another.
+  # This is a usage error (rc=2), not a "decision unverified" failure (rc=1).
+  if [ -n "$by_key" ] && [ -n "$by_origin" ]; then
+    usage >&2
+    exit 2
+  fi
+  case "$mode" in
+    all) ;;
+    *) fail "unknown list filter mode: $mode" ;;
+  esac
+  require_tasks_axi
+  if [ "$as_json" = 1 ]; then
+    command -v jq >/dev/null 2>&1 || fail "--json output requires jq"
+  fi
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] || continue
+    origin=$(basename "$meta" .meta)
+    [ -n "$by_origin" ] && [ "$origin" != "$by_origin" ] && continue
+    keys=$(meta_value "$meta" decision_keys)
+    [ -n "$keys" ] || continue
+    for key in $(printf '%s' "$keys" | tr ',' ' '); do
+      [ -n "$key" ] || continue
+      [ -n "$by_key" ] && [ "$key" != "$by_key" ] && continue
+      show=$(task_show "$(hold_id "$origin" "$key")") || continue
+      rows_holder="${rows_holder}$(list_row_for "$origin" "$key" "$show")"$'\x1e'
+    done
+  done
+
+  list_render_rows "$rows_holder" "$as_json"
+}
+
+# Format the row buffer either as human-readable text (default) or as a JSON
+# array (--json). The buffer uses \x1e (US) as the per-row separator; each row
+# itself is exactly 8 lines of `key=value`, in the fixed order list_row_for
+# documents. Splitting on \x1e gives one row per hold; fields are then read by
+# name so a future field addition or reorder does not break consumers.
+list_render_rows() {  # <rows-buffer> <as-json-0-or-1>
+  local rows=$1 as_json=$2 first=1 row key value
+  if [ -z "$rows" ]; then
+    if [ "$as_json" = 1 ]; then
+      printf '[]\n'
+    else
+      printf '0 results\n'
+    fi
+    return 0
+  fi
+  if [ "$as_json" = 1 ]; then printf '[\n'; fi
+  while IFS= read -r -d $'\x1e' row; do
+    [ -n "$row" ] || continue
+    if [ "$first" = 1 ]; then
+      first=0
+    elif [ "$as_json" = 1 ]; then
+      printf ',\n'
+    else
+      printf '\n'
+    fi
+    if [ "$as_json" = 1 ]; then
+      printf '{'
+      local i=0
+      while IFS= read -r line; do
+        i=$((i + 1))
+        key=${line%%=*}
+        value=${line#*=}
+        if [ "$i" -gt 1 ]; then printf ', '; else printf ' '; fi
+        printf '"%s": "%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+      done <<EOF
+$row
+EOF
+      printf '\n}'
+    else
+      while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        printf '  %-12s %s\n' "$key:" "$value"
+      done <<EOF
+$row
+EOF
+    fi
+  done <<EOF
+$rows
+EOF
+  if [ "$as_json" = 1 ]; then printf '\n]\n'; fi
+}
+
+# Escape a value for inclusion in a JSON string. The script's input surface
+# validates --reason as a single ASCII line with no parens, and field values
+# inherit that constraint, so the only escapes we need are the JSON-mandatory
+# ones (backslash, double quote, control characters).
+json_escape() {  # <value>
+  local v=$1 out='' c nl cr tab bs
+  nl=$(printf '\n_'); nl=${nl%_}
+  cr=$(printf '\r_'); cr=${cr%_}
+  tab=$(printf '\t_'); tab=${tab%_}
+  # The case pattern below matches a single literal backslash, which is
+  # the JSON escape character we want to expand to '\\'. Building it via
+  # printf avoids shellcheck flagging the literal backslash in source.
+  # shellcheck disable=SC1003
+  bs=$(printf '%s' '\\')
+  while IFS= read -r -n1 c || [ -n "$c" ]; do
+    case "$c" in
+      '') : ;;
+      "$bs")      out="${out}\\\\" ;;
+      '"')        out="${out}\\\"" ;;
+      "$nl")      out="${out}\\n" ;;
+      "$cr")      out="${out}\\r" ;;
+      "$tab")     out="${out}\\t" ;;
+      *)          out="${out}$c" ;;
+    esac
+  done <<EOF
+$v
+EOF
+  printf '%s' "$out"
+}
+
 case "${1:-}" in
   id) shift; command_id "$@" ;;
   hold) shift; command_hold "$@" ;;
   complete) shift; command_complete "$@" ;;
   verify) shift; command_verify "$@" ;;
   resolve) shift; command_resolve "$@" ;;
+  list) shift; command_list "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

@@ -2317,10 +2317,28 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
   fi
-  if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-      FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" verify "$ID" >/dev/null; then
-    echo "REFUSED: scout task $ID has not passed the unresolved-decision completion gate." >&2
-    echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
+  set +e
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+    FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" verify "$ID" >/dev/null
+  verify_rc=$?
+  set -e
+  if [ "$verify_rc" -ne 0 ]; then
+    # rc=20 is fm-decision-hold.sh's distinct "tool unavailable" code: tasks-axi
+    # is missing or below the compat floor, so we cannot prove the inventory
+    # passed OR failed. That is NOT the same as rc=1 "decision unverified",
+    # which is a real failure of the completion gate. Conflating the two used
+    # to mis-report the gate as failed when the tool itself was the problem
+    # (see fm-decision-hold.sh:require_tasks_axi and the §1.6 self-scaffolding
+    # note this fix pins). Both still refuse teardown because the gate status
+    # is unknown; only the diagnostic differs so the captain can act on the
+    # right surface (reinstall tasks-axi vs. complete the inventory).
+    if [ "$verify_rc" -eq 20 ]; then
+      echo "REFUSED: scout task $ID unresolved-decision completion gate is UNKNOWN: tool unavailable (rc=20); check tasks-axi install." >&2
+      echo "Cannot determine whether the inventory passed; reinstall or upgrade tasks-axi and retry, or use --force after explicit discard approval." >&2
+    else
+      echo "REFUSED: scout task $ID has not passed the unresolved-decision completion gate." >&2
+      echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
+    fi
     exit 1
   fi
 fi
