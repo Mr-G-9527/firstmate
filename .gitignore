@@ -7,6 +7,9 @@ data/
 .fm-secondmate-parent
 .DS_Store
 __pycache__/
+scratch/
+skills-lock.json
+.agents/skills/axi/
 *.pyc
 .env
 config/
