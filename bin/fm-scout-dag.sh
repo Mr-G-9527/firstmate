@@ -512,6 +512,13 @@ EOF
       head -n "$MAX_PARALLEL" "$ready" > "$capped"
       mv "$capped" "$ready"
     fi
+    # One captain notification per layer (the documented contract in the
+    # script header and docs/scripts.md). The captain sees a single line per
+    # layer boundary rather than per-scout noise; per-scout failure/decision
+    # detail still goes to stderr in the outcomes loop below.
+    local ready_ids
+    ready_ids=$(tr '\n' ' ' < "$ready" | sed 's/[[:space:]]*$//')
+    echo "layer $layer: $ready_ids"
     # Dispatch every ready node in parallel (each via its own backgrounded
     # spawn-bin call). A spawned fm-spawn.sh returns quickly; the actual scout
     # runs detached, so this does not serialize within the layer.
