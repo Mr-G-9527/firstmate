@@ -50,6 +50,16 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"${GROK_AGENT:-}${GROK_HOOK_EVENT:-}\" ] || exit 0; exec python3 \"$CLAUDE_PROJECT_DIR\"/tools/session_end.py"
+          }
+        ]
+      }
     ]
   }
 }

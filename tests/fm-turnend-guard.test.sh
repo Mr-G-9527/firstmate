@@ -797,12 +797,21 @@ test_tracked_claude_entries_inert_under_grok() {
   local dir cmd script target guarded=0 unguarded=0
   command -v jq >/dev/null 2>&1 || fail "test host must provide jq"
   dir="$TMP_ROOT/claude-entries-grok-inert"
-  mkdir -p "$dir/bin"
+  mkdir -p "$dir/bin" "$dir/tools"
   for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-sessionstart-run.sh \
     fm-arm-pretool-check.sh fm-cd-pretool-check.sh fm-subagent-pretool-check.sh; do
     printf '#!/usr/bin/env bash\nprintf ran >> %q\n' "$dir/invoked" > "$dir/bin/$script"
     chmod +x "$dir/bin/$script"
   done
+  # The SessionEnd hook calls python3 tools/session_end.py; stub it as a Python
+  # script that writes the same invoked marker so the same "reaches its target"
+  # check still applies across both bin/*.sh and tools/*.py targets.
+  cat > "$dir/tools/session_end.py" <<'PY'
+#!/usr/bin/env python3
+import os
+open(os.environ.get('CLAUDE_PROJECT_DIR', '.') + '/invoked', 'a').write('ran')
+PY
+  chmod +x "$dir/tools/session_end.py"
 
   # Runs one tracked command string and reports whether it reached its script.
   ran_under() {
@@ -813,7 +822,7 @@ test_tracked_claude_entries_inert_under_grok() {
 
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
-    target=$(printf '%s\n' "$cmd" | sed -n 's|.*/bin/\([a-z0-9-]*\.sh\).*|\1|p')
+    target=$(printf '%s\n' "$cmd" | sed -n 's/.*\/\(bin\|tools\)\/\([a-z0-9._-]\+\.\(sh\|py\)\).*/\2/p')
     [ -n "$target" ] || fail "could not identify the target script of tracked entry: $cmd"
 
     # Native Claude: EVERY tracked entry must still reach its script, or a guard
@@ -840,7 +849,7 @@ test_tracked_claude_entries_inert_under_grok() {
       || fail "tracked entry for $target ran under a legacy GROK_AGENT environment"
   done < <(jq -r '.hooks[][].hooks[].command' "$ROOT/.claude/settings.json")
 
-  [ "$guarded" -eq 5 ] || fail "expected 5 grok-guarded tracked entries, saw $guarded"
+  [ "$guarded" -eq 6 ] || fail "expected 6 grok-guarded tracked entries, saw $guarded"
   [ "$unguarded" -eq 1 ] || fail "expected 1 documented unguarded tracked entry, saw $unguarded"
   pass "tracked .claude/settings.json entries: $guarded inert under grok, the documented subagent exception still armed, all live under Claude"
 }

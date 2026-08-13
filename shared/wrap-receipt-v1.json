@@ -1,0 +1,15 @@
+[
+  {
+    "schema": "wrap-receipt-v1",
+    "note_id": "209a",
+    "session_id": "suggestion-mechanic-c-209a",
+    "label": "实测达成",
+    "label_meaning": "verified achieved",
+    "what_done": "Re-shipped Mechanic C: tools/session_end.py writes a 5-receipt label entry into shared/wrap-receipt-v1.json at session end; .claude/settings.json SessionEnd hook invokes it (commit de12e98).",
+    "what_deferred": "Reviewer aesthetic and captain-side escalation wiring remain on the post-209a backlog.",
+    "what_flag": "Receipt entries are auto-filled from session state in default mode; the --suggestion run uses the literal content above.",
+    "commit": "de12e98",
+    "timestamp": "2026-08-13T07:24:22Z",
+    "source": "session_end.py --suggestion"
+  }
+]
