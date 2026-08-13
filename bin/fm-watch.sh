@@ -1042,7 +1042,15 @@ EOF
     fi
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
-    #   - any status file carries a captain-relevant verb;
+    #   - any status file carries a captain-relevant terminal line that is NEW
+    #     since this task's per-wake last-seen-captain-relevant marker (the
+    #     .seen-* discipline on its own tracks size:mtime, not the latest line,
+    #     so a terminal line that arrives after a benign working: absorb would
+    #     otherwise sit until the 10-minute heartbeat backstop catches it -
+    #     signal_has_new_caprel_terminal closes that gap);
+    #   - any status file carries a captain-relevant verb (the original
+    #     signal_reason_is_actionable predicate, kept for parity with the
+    #     .seen-* discipline on tasks that have never recorded a marker);
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
     #     NOT provably working - the crew stopped its turn with no actively-running
     #     pipeline and no busy pane, so it may be done (even via an interactive menu
@@ -1052,7 +1060,10 @@ EOF
     # whose crew IS provably working) in always-on mode -> advance the markers so it
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # ordering evaluates it ONLY for a non-afk, no-new-caprel-verb, no-caprel-verb signal.
+    # Both branches then call mark_caprel_terminal_seen so a captain-relevant line
+    # that was absorbed (or surfaced) advances its per-task marker and is NOT
+    # re-fired on the next poll - only a still-newer captain-relevant line can fire.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if afk_present \
        || signal_has_new_caprel_terminal $files \
