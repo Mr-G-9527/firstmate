@@ -532,6 +532,66 @@ scan_signals() {
   return 0
 }
 
+# Per-task marker tracking the captain-relevant terminal line the per-wake poll
+# last saw on a status file. The marker is updated whenever the wake absorbs or
+# surfaces a captain-relevant line so a fresh terminal line that arrived after
+# the previous absorb (the .seen-* discipline does not catch this on its own -
+# it tracks size:mtime, not the latest line) can re-fire the wake as actionable
+# before the 10-minute heartbeat backstop catches it. Same .seen-* discipline:
+# the durable status file is always written before the marker, so nothing is
+# suppressed before it lands.
+_caprel_seen_path() {  # <task-id>
+  printf '%s/.seen-caprel-%s' "$STATE" "$(printf '%s' "$1" | LC_ALL=C tr ':/.' '___')"
+}
+
+# 0 (true) if any of the wake's status files carries a captain-relevant terminal
+# line (per FM_CLASSIFY_CAPTAIN_RE_DEFAULT in bin/fm-classify-lib.sh) that
+# differs from this task's per-wake last-seen-captain-relevant marker; 1
+# otherwise. Empty/unresolvable file lists return 1 - the absorb branch's
+# provably-working predicate handles that case. Used to re-fire a wake that was
+# absorbed because the pane was busy with a working: while a later done:,
+# failed:, needs-decision:, or blocked: landed in the same status file.
+signal_has_new_caprel_terminal() {  # <file> ...
+  local f base task last seen
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    last=$(last_status_line "$f" 2>/dev/null) || continue
+    [ -n "$last" ] || continue
+    status_is_captain_relevant "$last" || continue
+    seen=$(cat "$(_caprel_seen_path "$task")" 2>/dev/null || true)
+    [ "$seen" = "$last" ] || return 0
+  done
+  return 1
+}
+
+# Record the captain-relevant terminal line per task for the wake just processed
+# (either surfaced or absorbed). Called once per wake regardless of verdict so a
+# freshly arrived captain-relevant line that the absorb branch has just seen
+# advances its own marker and is NOT re-fired on the next poll - only a still
+# newer captain-relevant line can fire.
+mark_caprel_terminal_seen() {  # <file> ...
+  local f base task last
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    last=$(last_status_line "$f" 2>/dev/null) || continue
+    [ -n "$last" ] || continue
+    status_is_captain_relevant "$last" || continue
+    printf '%s' "$last" > "$(_caprel_seen_path "$task")"
+  done
+}
+
 # Deliver a durably queued process-event result to firstmate. Publication is
 # owned by bin/fm-procevent.sh - by the runner at capture time and by reconcile's
 # re-announcement - so this decides only whether a queued check record has been
@@ -982,7 +1042,15 @@ EOF
     fi
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
-    #   - any status file carries a captain-relevant verb;
+    #   - any status file carries a captain-relevant terminal line that is NEW
+    #     since this task's per-wake last-seen-captain-relevant marker (the
+    #     .seen-* discipline on its own tracks size:mtime, not the latest line,
+    #     so a terminal line that arrives after a benign working: absorb would
+    #     otherwise sit until the 10-minute heartbeat backstop catches it -
+    #     signal_has_new_caprel_terminal closes that gap);
+    #   - any status file carries a captain-relevant verb (the original
+    #     signal_reason_is_actionable predicate, kept for parity with the
+    #     .seen-* discipline on tasks that have never recorded a marker);
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
     #     NOT provably working - the crew stopped its turn with no actively-running
     #     pipeline and no busy pane, so it may be done (even via an interactive menu
@@ -992,9 +1060,15 @@ EOF
     # whose crew IS provably working) in always-on mode -> advance the markers so it
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # ordering evaluates it ONLY for a non-afk, no-new-caprel-verb, no-caprel-verb signal.
+    # Both branches then call mark_caprel_terminal_seen so a captain-relevant line
+    # that was absorbed (or surfaced) advances its per-task marker and is NOT
+    # re-fired on the next poll - only a still-newer captain-relevant line can fire.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if afk_present \
+       || signal_has_new_caprel_terminal $files \
+       || signal_reason_is_actionable $files \
+       || ! signal_crew_provably_working $files; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -1018,6 +1092,15 @@ $pending
 EOF
       triage_log "absorbed benign $reason"
     fi
+    # Record the captain-relevant terminal line per task for the wake we just
+    # processed. Done in BOTH branches so a captain-relevant line that was
+    # absorbed (e.g. a working: pane held off surfacing a prior done: that was
+    # already captain-relevant) advances its marker and is not re-fired on the
+    # next poll - only a still-newer captain-relevant line in the same status
+    # file can fire then. Cheap: per-file last_status_line + a single write
+    # only for tasks whose last line is captain-relevant.
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+    mark_caprel_terminal_seen $files
   fi
 
   # Layer 1 backbone: pane staleness. Two consecutive identical hashes with no busy
