@@ -288,7 +288,7 @@ sdag_compute_layers() {
     : > "$tmp_layer"
     while IFS='|' read -r id _ deps; do
       [ -n "$id" ] || continue
-      grep -F -- "$id|" "$tmp_done" >/dev/null 2>&1 && continue
+      if awk -F'|' -v k="$id" '$1==k {found=1; exit} END{exit !found}' "$tmp_done" >/dev/null 2>&1; then continue; fi
       local ready=1 d
       [ -n "$deps" ] || {
         printf '%s\n' "$id" >> "$tmp_layer"
