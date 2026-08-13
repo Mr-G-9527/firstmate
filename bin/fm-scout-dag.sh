@@ -145,7 +145,7 @@ sdag_classify() {
 # <deps> is a comma-separated list (no surrounding parens), possibly empty.
 sdag_parse_task() {
   local f=$1 id=$2 line rest
-  line=$(grep -F -- " $id -" "$f" 2>/dev/null | head -n 1) || return 1
+  line=$(awk -v k="$id" 'index($0, "- [ ] " k " -") == 1 || index($0, "- [x] " k " -") == 1 { print; exit }' "$f" 2>/dev/null) || return 1
   [ -n "$line" ] || return 1
   rest=${line#*- [ ]}
   rest=${rest#*- [x]}
@@ -198,7 +198,7 @@ EOF
     repo=${rest%%|*}
     deps=${rest#*|}
     deps=${deps%%|*}
-    kind=$(grep -F -- " $id -" "$f" 2>/dev/null | head -n 1 \
+    kind=$(awk -v k="$id" 'index($0, "- [ ] " k " -") == 1 || index($0, "- [x] " k " -") == 1 { print; exit }' "$f" 2>/dev/null \
       | sed -n 's/.*(kind:[[:space:]]*\([^ )]*\).*/\1/p')
     case ",$kinds," in
       *",$kind,"*) printf '%s|%s|%s\n' "$id" "$repo" "$deps" >> "$tmp" ;;
@@ -474,7 +474,7 @@ sdag_run() {
       # Walk the DAG: for every pending node, check whether any of its deps
       # has reached a hard failure verb. If yes, the DAG is stuck on a failed
       # dep and we must surface the manual-replan path.
-      while IFS='|' read -r pid deps _; do
+      while IFS='|' read -r pid _ deps; do
         [ -n "$pid" ] || continue
         poc=$(sdag_classify "$(last_status_line "$STATE/$pid.status" 2>/dev/null)")
         case "$poc" in
