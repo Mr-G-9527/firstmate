@@ -78,11 +78,7 @@ run_dag() {
   shift 2
   local spawn_bin=$TMP_ROOT/fakebin/fm-spawn.sh
   local out rc
-  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
-    FM_STATE_OVERRIDE="$home/state" \
-    FM_DATA_OVERRIDE="$home/data" \
-    FM_PROJECTS_OVERRIDE="$home/projects" \
-    FM_CONFIG_OVERRIDE="$home/config" \
+  out=$(FM_HOME="$home" \
     FM_TEST_STATE_DIR="$home/state" \
     PATH="$TMP_ROOT/fakebin:$PATH" \
     "$DAG" --spawn-bin "$spawn_bin" --poll-secs 1 --await-timeout-secs 30 \

@@ -260,7 +260,7 @@ EOF
     for dep in "${dep_arr[@]}"; do
       dep=$(printf '%s' "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
       [ -n "$dep" ] || continue
-      if ! printf '%s\n' "$dag" | grep -F -- "$dep|" >/dev/null 2>&1; then
+      if ! printf '%s\n' "$dag" | awk -F'|' -v k="$dep" '$1==k {found=1; exit} END{exit !found}' >/dev/null 2>&1; then
         echo "error: node $id depends on unknown id: $dep" >&2
         return 1
       fi
@@ -302,7 +302,7 @@ EOF
       for d in "${dep_arr[@]}"; do
         d=$(printf '%s' "$d" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$d" ] || continue
-        if ! grep -F -- "$d|" "$tmp_done" >/dev/null 2>&1; then ready=0; break; fi
+        if ! awk -F'|' -v k="$d" '$1==k {found=1; exit} END{exit !found}' "$tmp_done" >/dev/null 2>&1; then ready=0; break; fi
       done
       if [ "$ready" -eq 1 ]; then
         printf '%s\n' "$id" >> "$tmp_layer"
@@ -365,6 +365,7 @@ sdag_dispatch() {
   repo_path="$PROJECTS/$project"
   if [ ! -d "$repo_path" ]; then
     echo "warning: $id project dir not found: $repo_path" >&2
+    printf 'failed: project dir not found: %s\n' "$repo_path" >> "$sdir/$id.status"
     return 4
   fi
   "$SPAWN_BIN" "$id" "$repo_path" --scout >/dev/null 2>&1 &
@@ -376,33 +377,42 @@ sdag_dispatch() {
 # file until every id leaves working/empty, then write "<id>|<outcome>|<line>"
 # rows to <outcomes-file>. Bounded by AWAIT_TIMEOUT_SECS.
 sdag_wait_layer() {
-  local sdir=$1 ids=$2 outcomes=$3 deadline id total last outcome done_count
+  local sdir=$1 ids=$2 outcomes=$3 deadline id total last outcome done_count recorded
   deadline=$(( $(date +%s) + AWAIT_TIMEOUT_SECS ))
   : > "$outcomes"
+  recorded=$(mktemp)
   while :; do
     done_count=0
     total=0
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       total=$((total + 1))
+      if grep -Fx -- "$id" "$recorded" >/dev/null 2>&1; then
+        done_count=$((done_count + 1))
+        continue
+      fi
       last=$(last_status_line "$sdir/$id.status" 2>/dev/null) || last=
       outcome=$(sdag_classify "$last")
       case "$outcome" in
         done|failed|blocked|needs-decision|paused)
           printf '%s|%s|%s\n' "$id" "$outcome" "$last" >> "$outcomes"
+          printf '%s\n' "$id" >> "$recorded"
           done_count=$((done_count + 1))
           ;;
       esac
     done < "$ids"
-    if [ "$total" -gt 0 ] && [ "$done_count" -eq "$total" ]; then return 0; fi
+    if [ "$total" -gt 0 ] && [ "$done_count" -eq "$total" ]; then rm -f "$recorded"; return 0; fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "warning: await timeout ($AWAIT_TIMEOUT_SECS s) reached" >&2
       while IFS= read -r id; do
         [ -n "$id" ] || continue
+        if grep -Fx -- "$id" "$recorded" >/dev/null 2>&1; then continue; fi
         last=$(last_status_line "$sdir/$id.status" 2>/dev/null) || last=
         outcome=$(sdag_classify "$last")
         printf '%s|%s|%s\n' "$id" "$outcome" "$last" >> "$outcomes"
+        printf '%s\n' "$id" >> "$recorded"
       done < "$ids"
+      rm -f "$recorded"
       return 0
     fi
     sleep "$POLL_SECS" 2>/dev/null || sleep 1
@@ -501,16 +511,6 @@ EOF
       local capped; capped=$(mktemp)
       head -n "$MAX_PARALLEL" "$ready" > "$capped"
       mv "$capped" "$ready"
-    fi
-    if [ "$DRY_RUN" -eq 1 ]; then
-      echo "Layer $layer:"
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        echo "  $id"
-      done < "$ready"
-      rm -f "$ready"
-      layer=$((layer + 1))
-      continue
     fi
     # Dispatch every ready node in parallel (each via its own backgrounded
     # spawn-bin call). A spawned fm-spawn.sh returns quickly; the actual scout
