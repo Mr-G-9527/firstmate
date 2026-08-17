@@ -165,7 +165,9 @@ test_inbox_absorb_does_not_advance_seen_marker() {
   # NOT touched.
   printf 'placeholder' > "$state/captain-inbox.jsonl"
   printf '%s' 11 > "$state/.captain-inbox.offset"
-  seen_before='0:0'
+  # Seed a FRESH inbox marker so the signal is truly status-only (a stale marker
+  # would make inbox_in_files=1 and, per the fix, legitimately actionable).
+  seen_before=$(stat -c '%s:%Y' "$state/captain-inbox.jsonl")
   printf '%s' "$seen_before" > "$state/.seen-captain-inbox_jsonl"
   printf 'working: setup\n' > "$state/task.status"
   watch_bg_inbox "$state" "$fakebin" "$out" FM_FAKE_CREW_STATE='state: working · source: run-step · busy'
