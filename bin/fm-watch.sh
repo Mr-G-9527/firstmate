@@ -1020,26 +1020,17 @@ while :; do
     done <<EOF
 $pending
 EOF
-    # P2 (2026-08-04 codex C*, live-fix): when captain-inbox.jsonl is the
-    # changed file, the inbox MUST drain without /fm-wake. Run the drain
-    # here so its output (chat blocks + dispatch markers) flows to the
-    # watcher's stdout; arm.sh captures it, and the hook banner shows the
-    # chat block on the rewake. The drain also advances the inbox offset,
-    # so subsequent drains are no-ops until new rows land.
-    inbox_drain_out=
-    inbox_drain_rc=0
-    if case "$files" in *captain-inbox.jsonl*) true ;; *) false ;; esac; then
-      inbox_drain_out=$("$SCRIPT_DIR/fm-captain-inbox-drain.sh" 2>&1) || inbox_drain_rc=$?
-    fi
-    if [ -n "$inbox_drain_out" ]; then
-      # Compose a wake payload that embeds the drain's rendered output.
-      # fm_wake_append's payload cleaner tr/newlines to spaces, so collapse
-      # here to one tab-separated block per drained row.
-      collapsed=$(printf '%s' "$inbox_drain_out" | awk 'BEGIN{RS=""; ORS=" | "} {gsub(/\n/, " "); print}' | sed 's/ | $//')
-      reason="inbox-drain rc=${inbox_drain_rc}: ${collapsed}"
-    else
-      reason="signal:$files"
-    fi
+    # P2 (2026-08-04 codex C*, live-fix) plus 2026-08-17 fm-autodrain-fix-01:
+    # when captain-inbox.jsonl is the changed file, the inbox MUST drain without
+    # /fm-wake. Drain + reason build now run inside the actionable branch only,
+    # because draining on the absorb path silently advanced the inbox offset and
+    # discarded the rendered chat block - the captain's row was processed but
+    # the LLM was never notified, so manual /fm-wake was needed after every
+    # dispatch. By gating the drain on actionability, an absorbed captain inbox
+    # row stays in the inbox until a non-busy cycle re-detects it (the
+    # absorb branch will also skip its .seen-* marker so the re-poll fires).
+    inbox_in_files=0
+    case "$files" in *captain-inbox.jsonl*) inbox_in_files=1 ;; esac
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant terminal line that is NEW
@@ -1055,12 +1046,22 @@ EOF
     #     NOT provably working - the crew stopped its turn with no actively-running
     #     pipeline and no busy pane, so it may be done (even via an interactive menu
     #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
-    #     such a turn-end is exactly the swallowed-finish this change guards against.
-    # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
-    # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. The provably-working
+    #     such a turn-end is exactly the swallowed-finish this change guards against;
+    #   - or the changed file list includes captain-inbox.jsonl - a captain
+    #     message is INHERENTLY actionable: the captain sent it explicitly, so a
+    #     provably-working crew must still wake to surface it. This is the
+    #     fm-autodrain-fix-01 fix; the absorb path previously drained the inbox
+    #     silently and dropped the rendered chat block, forcing manual /fm-wake
+    #     after every dispatch. We never absorb an inbox signal; the absorb
+    #     branch below also skips the inbox entry's .seen-* marker so the next
+    #     poll re-detects the change and tries again once the crew is non-busy.
+    # Actionable -> enqueue, advance .seen-* markers, drain inbox, exit.
+    # Benign (a no-verb wake whose crew IS provably working AND no inbox change)
+    # in always-on mode -> advance the non-inbox markers so they will not
+    # re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-new-caprel-verb, no-caprel-verb signal.
+    # ordering evaluates it ONLY for a non-afk, no-new-caprel-verb, no-caprel-verb,
+    # no-inbox-change signal.
     # Both branches then call mark_caprel_terminal_seen so a captain-relevant line
     # that was absorbed (or surfaced) advances its per-task marker and is NOT
     # re-fired on the next poll - only a still-newer captain-relevant line can fire.
@@ -1068,7 +1069,25 @@ EOF
     if afk_present \
        || signal_has_new_caprel_terminal $files \
        || signal_reason_is_actionable $files \
+       || [ "$inbox_in_files" -eq 1 ] \
        || ! signal_crew_provably_working $files; then
+      # Drain inbox ONLY in the actionable branch. A drained chat block whose
+      # wake was then absorbed would discard the captain's row silently; we
+      # avoid that by deferring the drain until we know we will wake.
+      inbox_drain_out=
+      inbox_drain_rc=0
+      if [ "$inbox_in_files" -eq 1 ]; then
+        inbox_drain_out=$("$SCRIPT_DIR/fm-captain-inbox-drain.sh" 2>&1) || inbox_drain_rc=$?
+      fi
+      if [ -n "$inbox_drain_out" ]; then
+        # Compose a wake payload that embeds the drain's rendered output.
+        # fm_wake_append's payload cleaner tr/newlines to spaces, so collapse
+        # here to one tab-separated block per drained row.
+        collapsed=$(printf '%s' "$inbox_drain_out" | awk 'BEGIN{RS=""; ORS=" | "} {gsub(/\n/, " "); print}' | sed 's/ | $//')
+        reason="inbox-drain rc=${inbox_drain_rc}: ${collapsed}"
+      else
+        reason="signal:$files"
+      fi
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -1084,13 +1103,18 @@ $pending
 EOF
       wake "$reason"
     else
+      # Absorb branch: never advance the inbox .seen-* marker (or drain the
+      # inbox) so a captain row stays visible for the next poll's actionable
+      # gate. Status/turn-ended markers DO advance, preserving the existing
+      # discipline for non-inbox signals.
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
+        case "$f" in *captain-inbox.jsonl) continue ;; esac
         printf '%s' "$sig" > "$sf"
       done <<EOF
 $pending
 EOF
-      triage_log "absorbed benign $reason"
+      triage_log "absorbed benign signal:$files (inbox preserved: $inbox_in_files row(s) waiting for a non-busy cycle)"
     fi
     # Record the captain-relevant terminal line per task for the wake we just
     # processed. Done in BOTH branches so a captain-relevant line that was
