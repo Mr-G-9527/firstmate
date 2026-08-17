@@ -379,7 +379,7 @@ EOF
     ;;
   *)  # no-mistakes
     SETUP2="
-2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
+4. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
@@ -424,7 +424,9 @@ You are in a disposable git worktree of $REPO, at a detached HEAD on a clean def
 The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
 If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
 
-1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+1. First action: create your branch: \`git checkout -b fm/$ID\`.
+2. Install the firstmate commit-msg guard in this worktree so every commit cannot carry a Co-Authored-By agent trailer (enforces the AGENTS.md no-agent-co-author rule structurally): \`git config core.hooksPath "$FM_ROOT/bin/git-hooks"\`. The hook strips the upstream Claude Code default trailer and any other agent vendor trailer; real human co-author lines pass through unchanged. Run \`git config core.hooksPath\` to confirm before your first commit.
+3. If \`bin/git-hooks/commit-msg\` is unreadable (e.g. the firstmate root is on a different host for a remote-project worktree), append \`blocked: cannot install firstmate commit-msg guard - $FM_ROOT/bin/git-hooks unreachable\` and stop instead of bypassing it.$SETUP2
 
 # Rules
 $RULE1

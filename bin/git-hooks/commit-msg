@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Strip agent Co-Authored-By trailers from commit messages.
+#
+# Per firstmate-coding-guidelines: "Never add an agent name as a commit co-author."
+# Per AGENTS.md section 1: "Never add an agent name as a commit co-author."
+#
+# This hook is the structural enforcement: worker harness commit tools inherit
+# the upstream Claude Code default trailer
+# (Co-Authored-By: Claude <noreply@anthropic.com>) and cannot reliably be told
+# not to. Stripping at commit-msg time guarantees the trailer never lands
+# regardless of how the message was composed.
+#
+# Match: any "Co-Authored-By:" trailer line whose name OR email contains a
+# known agent vendor marker (claude, codex, gpt, anthropic, openai, gemini,
+# llama, mistral, qwen, deepseek, kimi, pi, muse, grok). Case-insensitive on
+# name and email. Real human co-authors pass through unchanged.
+#
+# Install in a worker worktree with:
+#   git config core.hooksPath "<firstmate-root>/bin/git-hooks"
+# The fm-brief.sh ship Setup section runs that command for every ship task.
+set -eu
+
+MSG_FILE=${1:-}
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+  printf 'fm-commit-msg: commit message file argument missing or unreadable\n' >&2
+  exit 1
+fi
+
+ORIGINAL=$(cat "$MSG_FILE")
+
+# Lowercase the original line-by-line so the agent-name match is
+# case-insensitive without relying on awk IGNORECASE (which is gawk-only).
+LOWER=$(mktemp)
+trap 'rm -f "$LOWER"' EXIT
+printf '%s\n' "$ORIGINAL" | tr '[:upper:]' '[:lower:]' > "$LOWER"
+
+# Walk every line; pick the corresponding lowercased line via sed NR p, then
+# classify it. Print NR for any line that should be stripped; the second pass
+# drops those exact line numbers from the original.
+STRIP_LINES=$(awk -v lower="$LOWER" '
+  {
+    lo = ""
+    cmd = "sed -n " NR "p " lower
+    cmd | getline lo
+    close(cmd)
+    if (lo ~ /^co-authored-by:/) {
+      if (lo ~ /noreply@anthropic\.com/ \
+          || lo ~ /claude/ \
+          || lo ~ /codex/ \
+          || lo ~ /anthropic/ \
+          || lo ~ /openai/ \
+          || lo ~ /chatgpt/ \
+          || lo ~ /gpt/ \
+          || lo ~ /gemini/ \
+          || lo ~ /llama/ \
+          || lo ~ /mistral/ \
+          || lo ~ /qwen/ \
+          || lo ~ /deepseek/ \
+          || lo ~ /kimi/ \
+          || lo ~ /[[:space:]]pi[[:space:]]/ \
+          || lo ~ /muse/ \
+          || lo ~ /grok/) {
+        print NR
+      }
+    }
+  }
+' "$MSG_FILE")
+
+if [ -z "$STRIP_LINES" ]; then
+  exit 0
+fi
+
+printf 'fm-commit-msg: stripped agent Co-Authored-By trailer(s) per AGENTS.md no-agent-co-author rule\n' >&2
+
+CLEANED=$(awk -v strip="$STRIP_LINES" '
+  BEGIN {
+    n = split(strip, lines, "\n")
+    for (i = 1; i <= n; i++) drop[lines[i]] = 1
+  }
+  NR in drop { next }
+  { print }
+' "$MSG_FILE")
+
+printf '%s\n' "$CLEANED" > "$MSG_FILE"
+exit 0
