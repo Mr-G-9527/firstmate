@@ -30,9 +30,9 @@ INBOX_DRAIN="$ROOT/bin/fm-captain-inbox-drain.sh"
 [ -x "$SPAWN_HELPER" ] || fail "research-worker-spawn not executable"
 [ -x "$INBOX_DRAIN" ]  || fail "captain-inbox-drain not executable"
 
-grep -F 'LAUNCH_CMD="exec env FM_RESEARCH_WORKER=1' "$SPAWN_HELPER" >/dev/null \
-  || fail "worker launch must exec the one-shot claude process"
-pass "0. worker pane execs claude without a jsonl readiness gate"
+grep -F 'LAUNCH_CMD="env FM_RESEARCH_WORKER=1' "$SPAWN_HELPER" >/dev/null \
+  || fail "worker launch must set the worker-mode env and run claude -p"
+pass "0. worker pane launches claude -p without a jsonl readiness gate"
 
 TMP_ROOT=$(fm_test_tmproot fm-research-worker-spawn)
 
@@ -46,8 +46,22 @@ mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/tmux" <<'SH'
 #!/usr/bin/env bash
 # Fake tmux: minimal commands used by fm_backend_tmux_container_ensure
-# + fm_backend_tmux_create_task. Records every invocation.
+# + fm_backend_tmux_create_task + fm_backend_tmux_capture (so the spawn
+# helper's shell-ready warm-up probe can succeed). Records every invocation
+# and keeps a per-window text buffer for capture-pane to read back.
 echo "tmux $*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+pane_buffer_dir="${FM_FAKE_TMUX_PANE_DIR:-/tmp/fm-fake-tmux-panes}"
+mkdir -p "$pane_buffer_dir"
+target_of() {
+  # extract the -t <target> slot from the args, if any
+  local prev=
+  for a in "$@"; do
+    case "$prev" in
+      -t) printf '%s' "$a"; return ;;
+    esac
+    prev="$a"
+  done
+}
 case "$1" in
   has-session) exit 0 ;;
   new-session) exit 0 ;;
@@ -56,21 +70,39 @@ case "$1" in
     if [ "${FM_FAKE_TMUX_FAIL_NEW_WINDOW:-0}" = "1" ]; then
       exit 7
     fi
-    # Print a stable window id (matching tmux's @N format).
     printf '%s\n' "@1"
     exit 0
     ;;
   set-window-option) exit 0 ;;
   send-keys)
-    # The production adapter submits a shell command into the new tmux
-    # window. Execute that command in the fake so this test exercises the
-    # session-file boundary instead of merely asserting a send-keys call.
+    target=$(target_of "$@")
     shift
-    if [ "${1:-}" = "-t" ]; then shift 2; fi
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -t) shift 2 ;;
+        -l) shift ;;
+        *) break ;;
+      esac
+    done
     text="${1:-}"
+    # Record the literal text into the pane buffer so capture-pane can
+    # verify the warm-up probe token immediately (real bash would echo it
+    # after running the printf; the fake collapses the two-step into one).
+    if [ -n "$target" ]; then
+      buf="$pane_buffer_dir/$(printf '%s' "$target" | tr -c 'A-Za-z0-9' '_')"
+      printf '%s\n' "$text" >> "$buf"
+    fi
     case "$text" in
       *" claude "*) bash -c "$text" ;;
     esac
+    exit 0
+    ;;
+  capture-pane)
+    target=$(target_of "$@")
+    if [ -n "$target" ]; then
+      buf="$pane_buffer_dir/$(printf '%s' "$target" | tr -c 'A-Za-z0-9' '_')"
+      [ -f "$buf" ] && cat "$buf"
+    fi
     exit 0
     ;;
   kill-window) exit 0 ;;
@@ -359,5 +391,54 @@ set -e
 [ ! -e "$CASE/.claude/projects"/*/*.jsonl ] \
   || fail "6. test setup unexpectedly wrote a Claude jsonl"
 pass "6. absent Claude jsonl does not kill or retry an accepted worker dispatch"
+
+#======================================================================
+# Case 8: fresh-window launch uses the 3-step (literal + sleep + send_key)
+# pattern, NOT the single-call fm_backend_tmux_send_text_line. A freshly
+# created window's interactive shell can exist before its startup files and
+# line editor are ready to accept Enter as a submit (verified live on a
+# nested tmux setup: text+Enter in one tmux send-keys call silently dropped
+# the command, leaving the pane at a blank prompt with no worker process
+# ever started). The helper must mirror fm-spawn.sh's launch-section
+# pattern or the dispatch will look complete while no worker is running.
+#======================================================================
+CASE="$TMP_ROOT/fresh-shell"
+mkdir -p "$CASE/state" "$CASE/data/executor-jobs" "$CASE/.claude/projects"
+export FM_HOME="$CASE"
+export FM_ROOT_OVERRIDE="$CASE"
+export CLAUDE_CONFIG_DIR="$CASE/.claude"
+export PATH="$FAKEBIN:$PATH"
+export FM_FAKE_TMUX_LOG="$CASE/fake-tmux.log"
+export FM_FAKE_CLAUDE_LOG="$CASE/fake-claude.log"
+export FM_FAKE_CLAUDE_PROJECT_DIR="$CASE"
+
+CORR="rws-fresh-$RANDOM"
+ROW_JSON='{"task_type":"report_research","must_answer":["Q1"]}'
+
+bash "$SPAWN_HELPER" "$CORR" "$ROW_JSON" "$CASE" >/dev/null 2>&1 \
+  || fail "8. fresh-shell spawn failed: $(cat "$CASE/data/executor-jobs/$CORR.spawn.out" 2>/dev/null)"
+
+# The single-call form would log exactly ONE send-keys whose third argument
+# (after the source-side -t <target>) is the launch command text. The 3-step
+# form logs TWO send-keys: one with -l <command>, then one with Enter.
+# Confirm the launch command went out via the literal-then-Enter pattern.
+grep -E "^tmux send-keys -t .* -l .*claude -p" "$CASE/fake-tmux.log" >/dev/null \
+  || fail "8. launch command was not sent via send-keys -l (3-step pattern missing); log: $(cat "$CASE/fake-tmux.log")"
+grep -E "^tmux send-keys -t .* Enter$" "$CASE/fake-tmux.log" >/dev/null \
+  || fail "8. separate Enter was not sent after the literal text; log: $(cat "$CASE/fake-tmux.log")"
+
+# Confirm the single-call form is NOT used for the launch command. A
+# single-call fm_backend_tmux_send_text_line would log the launch command
+# IMMEDIATELY after the target (no -l flag), as in
+#   tmux send-keys -t <target> exec env ...
+if grep -E "^tmux send-keys -t [^ ]+ exec env FM_RESEARCH_WORKER=1 " "$CASE/fake-tmux.log" >/dev/null; then
+  fail "8. launch command was sent via single-call form (fm_backend_tmux_send_text_line), which drops the command on a fresh window; log: $(cat "$CASE/fake-tmux.log")"
+fi
+# Also fail if the launch was wrapped in exec, because the execed shell exits
+# the moment claude -p is unbound (verified live on a nested tmux setup).
+if grep -E "^tmux send-keys -t [^ ]+ -l exec env FM_RESEARCH_WORKER=1 " "$CASE/fake-tmux.log" >/dev/null; then
+  fail "8. launch command used 'exec' which lets the shell exit instead of outliving claude -p; log: $(cat "$CASE/fake-tmux.log")"
+fi
+pass "8. fresh-window launch uses the 3-step pattern (literal + sleep + send_key Enter) and keeps the shell alive"
 
 echo "ok - all fm-research-worker-spawn tests passed"

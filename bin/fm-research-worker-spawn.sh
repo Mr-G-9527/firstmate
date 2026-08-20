@@ -243,22 +243,81 @@ else
 fi
 WINDOW_TARGET="${TMUX_SESSION}:${WINDOW_NAME}"
 
+# 3c-prime. Wait for the new window's interactive shell to actually be reading
+# input. A freshly-created window can exist before its startup files and line
+# editor are ready to accept Enter as a submit (verified live on a nested tmux
+# setup: the first send-keys silently dropped the command, leaving the pane at
+# a blank prompt with no worker process ever started). The probe mirrors the
+# warm-up loop in tests/fm-backend-tmux-smoke.test.sh: a tiny printf the shell
+# can only run after it has accepted input and produced output.
+#
+# The probe count and sleep are env-tunable so the tests can shorten them
+# without weakening the production path. Defaults are 50 attempts of 0.1s
+# = up to 5s of waiting before fail-closed.
+PROBE_ATTEMPTS="${FM_RESEARCH_WORKER_SHELL_READY_ATTEMPTS:-50}"
+PROBE_SLEEP="${FM_RESEARCH_WORKER_SHELL_READY_SLEEP:-0.1}"
+case "$PROBE_ATTEMPTS" in ''|*[!0-9]*) PROBE_ATTEMPTS=50 ;; esac
+case "$PROBE_SLEEP" in
+  ''|*[!0-9.]*) PROBE_SLEEP=0.1 ;;
+  *) [ "$(awk "BEGIN{print ($PROBE_SLEEP <= 0)}")" = "1" ] && PROBE_SLEEP=0.1 ;;
+esac
+PROBE_TOKEN="fm-rws-shell-ready-$$"
+SHELL_READY=0
+for _ in $(seq 1 "$PROBE_ATTEMPTS"); do
+  tmux send-keys -t "$WINDOW_TARGET" C-c >/dev/null 2>&1 || true
+  tmux send-keys -t "$WINDOW_TARGET" -l "printf '${PROBE_TOKEN}\\n'" >/dev/null 2>&1 || true
+  tmux send-keys -t "$WINDOW_TARGET" Enter >/dev/null 2>&1 || true
+  if fm_backend_tmux_capture "$WINDOW_TARGET" 200 2>/dev/null | grep -q "$PROBE_TOKEN"; then
+    SHELL_READY=1
+    break
+  fi
+  sleep "$PROBE_SLEEP"
+done
+if [ "$SHELL_READY" -ne 1 ]; then
+  tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
+  rm -f "$DATA_BRIEF"
+  echo "fm-research-worker-spawn: tmux window $WINDOW_TARGET shell did not become ready for input within $((PROBE_ATTEMPTS * 100 / 10))ms" >&2
+  exit 1
+fi
+
 # 3c. Launch a one-shot fresh worker. Pass the task through stdin rather than
 # typing its full content into tmux: task text cannot be reinterpreted as shell
-# syntax. `exec` makes the one-shot pane close with claude -p, avoiding manual
-# numeric tmux cleanup. A sent command is the worker receipt; jsonl persistence
-# is intentionally not a readiness gate.
+# syntax. The launch command does NOT use `exec`: claude -p runs as a child
+# of the persistent shell, so the pane stays alive until claude itself exits,
+# and the watcher can clean up the window via kill-window once the worker
+# submits. (Earlier revisions used `exec` to short-circuit the shell, but on
+# a nested tmux setup the parent shell's exit closed the pane before claude
+# had a chance to bind to the controlling tty, so we let the shell stick
+# around.) A sent command is the worker receipt; jsonl persistence is
+# intentionally not a readiness gate.
+#
+# Why literal + sleep + send_key Enter instead of fm_backend_tmux_send_text_line:
+# a freshly-created window's interactive shell can exist before its startup
+# files and line editor are ready to accept Enter as a submit (verified live
+# on a nested tmux setup: the first send-keys with text+Enter in one call
+# silently dropped the command, leaving the pane at a blank prompt with no
+# claude -p process ever started). fm-spawn.sh's launch command already uses
+# this 3-step pattern for the same reason; we mirror it here.
 printf -v Q_SESSION '%q' "$SESSION_ID"
 printf -v Q_BRIEF '%q' "$DATA_BRIEF"
 printf -v Q_LOG '%q' "$WORKER_LOG"
-LAUNCH_CMD="exec env FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
-if fm_backend_tmux_send_text_line "$WINDOW_TARGET" "$LAUNCH_CMD"; then
-  :
+LAUNCH_CMD="env FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
+if fm_backend_tmux_send_literal "$WINDOW_TARGET" "$LAUNCH_CMD"; then
+  sleep 0.3
+  if fm_backend_tmux_send_key "$WINDOW_TARGET" Enter; then
+    :
+  else
+    SPAWN_RC=$?
+    tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
+    rm -f "$DATA_BRIEF"
+    echo "fm-research-worker-spawn: send_key Enter to $WINDOW_TARGET failed rc=$SPAWN_RC" >&2
+    exit 1
+  fi
 else
   SPAWN_RC=$?
   tmux kill-window -t "$WINDOW_TARGET" 2>/dev/null || true
   rm -f "$DATA_BRIEF"
-  echo "fm-research-worker-spawn: send-keys to $WINDOW_TARGET failed rc=$SPAWN_RC" >&2
+  echo "fm-research-worker-spawn: send_literal to $WINDOW_TARGET failed rc=$SPAWN_RC" >&2
   exit 1
 fi
 
