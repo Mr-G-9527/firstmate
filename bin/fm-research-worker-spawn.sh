@@ -87,6 +87,22 @@ if [ -n "$REVISION_SEQ" ]; then
   printf -v REVISION_CONTEXT 'This is revision feedback for corr=%s (feedback seq=%s). Read the original frozen brief at `%s`, revise its declared artifact in place, then submit using the feedback row sequence.\n' "$CORR" "$REVISION_SEQ" "$ORIGINAL_BRIEF"
 fi
 
+# ----- 0.5 pre-spawn guard (Wave-3 SOP 2026-08-20) ------------------
+# Fail-fast against WSL/Win dual-repo drift AND unverifiable commit refs
+# in the brief we're about to write. Both checks are no-ops if the
+# helper / brief don't exist, so this is safe to keep on for production
+# spawns while remaining a quiet seam for tests.
+PRE_SPAWN_GUARD="${CSW_PRE_SPAWN_GUARD:-/mnt/c/Users/westwell/carbon-silicon-workshop/bin/fm-pre-spawn-guard.sh}"
+if [ -x "$PRE_SPAWN_GUARD" ]; then
+  bash "$PRE_SPAWN_GUARD" --sync-check || {
+    rc=$?
+    echo "fm-research-worker-spawn: pre-spawn sync-check failed rc=$rc" >&2
+    exit $rc
+  }
+else
+  echo "fm-research-worker-spawn: pre-spawn guard not found at $PRE_SPAWN_GUARD (skipping sync check)" >&2
+fi
+
 # ----- 1. idempotency -----------------------------------------------------
 # A re-drain must not duplicate the same normal or revision worker run.
 if [ -f "$META_DIR/$RUN_KEY.meta" ]; then
@@ -218,6 +234,15 @@ $REVISION_CONTEXT
 - Stay within the windows_roots the contract declares; do not read or
   write outside the listed evidence paths.
 EOF
+
+# ----- 2.5 verify brief commit refs (Wave-3 SOP 2026-08-20) --------------
+if [ -x "$PRE_SPAWN_GUARD" ]; then
+  bash "$PRE_SPAWN_GUARD" --brief-commit-verify "$DATA_BRIEF" || {
+    rc=$?
+    echo "fm-research-worker-spawn: brief commit-verify failed rc=$rc" >&2
+    exit $rc
+  }
+fi
 
 # ----- 3. spawn worker (direct tmux + claude, NO treehouse) ---------------
 SPAWN_OUT="$META_DIR/$RUN_KEY.spawn.out"
