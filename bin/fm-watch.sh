@@ -310,7 +310,27 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason corr worker_log
+  # Post-submit FM_RESEARCH_WORKER guard. A pane whose FM_RESEARCH_WORKER
+  # subprocess has already declared `state: done ...` in its dispatcher's
+  # data/executor-jobs/<corr>.worker.log is finished work, not a stuck
+  # harness; the post-submit tmux pane sitting at `$` until cleanup is
+  # by design. Without this check wedge_timer_check keeps escalating
+  # `stale: <window> (idle <s>s, possible wedge, escalation N)` against
+  # the same pane every STALE_ESCALATE_SECS, and the counter climbs
+  # past FM_WEDGE_DEMAND_INSPECT_COUNT and acquires a demand-deep-inspection
+  # suffix purely on heuristic idle time. Pinned by
+  # tests/fm-watch-research-worker-stale.test.sh (regression observed
+  # 2026-08-20 and 2026-08-21 on dogfood-0820 / dogfood-0821 panes).
+  if [ "${win#firstmate:fm-executor-}" != "$win" ] && [ -n "${FM_HOME:-}" ]; then
+    corr="${win#firstmate:fm-executor-}"
+    worker_log="$FM_HOME/data/executor-jobs/$corr.worker.log"
+    if [ -f "$worker_log" ] && grep -q -E '^state:[[:space:]]+done' "$worker_log" 2>/dev/null; then
+      triage_log "absorbed $label submitted-research-worker stale: $win"
+      rm -f "$since_file" "$escalation_file"
+      return 0
+    fi
+  fi
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -1085,6 +1105,18 @@ EOF
         # here to one tab-separated block per drained row.
         collapsed=$(printf '%s' "$inbox_drain_out" | awk 'BEGIN{RS=""; ORS=" | "} {gsub(/\n/, " "); print}' | sed 's/ | $//')
         reason="inbox-drain rc=${inbox_drain_rc}: ${collapsed}"
+      elif [ "$inbox_in_files" -eq 1 ]; then
+        # 2026-08-23 drain-consumed fix (friction: fm judged a real task row as
+        # a false alarm because a prior drain had already consumed it, so this
+        # drain returned empty and the bare "signal:" reason carried no task
+        # identity). The inbox grew since the last .seen marker, so at least one
+        # row landed and was consumed by an earlier drain (offset advanced).
+        # Surface the tail of captain-outbox.jsonl - the durable received-acks -
+        # so the wake payload names the corr/seq the earlier drain processed and
+        # fm can act on it instead of guessing. Tail -3 bounds the payload; rows
+        # are single-line JSON.
+        recent_acks=$(tail -n 3 "$STATE/captain-outbox.jsonl" 2>/dev/null | tr '\n' ' ' | cut -c1-900) || recent_acks=
+        reason="inbox-drain rc=0 (empty: rows already consumed by an earlier drain; recent captain-outbox acks): ${recent_acks:-no outbox rows}"
       else
         reason="signal:$files"
       fi

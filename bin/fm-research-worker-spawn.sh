@@ -258,7 +258,7 @@ WORKER_LOG="$META_DIR/$RUN_KEY.worker.log"
 
 # 3b. Create the dedicated worker window. Preserve the backend adapter failure
 # code; `if ! command; then $?` would only observe the status of `!` (zero).
-if fm_backend_tmux_create_task "$TMUX_SESSION" "$WINDOW_NAME" "$PROJECT_DIR" >/dev/null; then
+if WINDOW_ID="$(fm_backend_tmux_create_task "$TMUX_SESSION" "$WINDOW_NAME" "$PROJECT_DIR")"; then
   :
 else
   SPAWN_RC=$?
@@ -266,7 +266,7 @@ else
   echo "fm-research-worker-spawn: tmux create failed rc=$SPAWN_RC" >&2
   exit 1
 fi
-WINDOW_TARGET="${TMUX_SESSION}:${WINDOW_NAME}"
+WINDOW_TARGET="${WINDOW_ID:-${TMUX_SESSION}:${WINDOW_NAME}}"
 
 # 3c-prime. Wait for the new window's interactive shell to actually be reading
 # input. A freshly-created window can exist before its startup files and line
@@ -326,7 +326,7 @@ fi
 printf -v Q_SESSION '%q' "$SESSION_ID"
 printf -v Q_BRIEF '%q' "$DATA_BRIEF"
 printf -v Q_LOG '%q' "$WORKER_LOG"
-LAUNCH_CMD="env FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
+LAUNCH_CMD="env FM_RESEARCH_WORKER=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false MAX_THINKING_TOKENS=32000 claude -p --permission-mode bypassPermissions --session-id $Q_SESSION < $Q_BRIEF > $Q_LOG 2>&1"
 if fm_backend_tmux_send_literal "$WINDOW_TARGET" "$LAUNCH_CMD"; then
   sleep 0.3
   if fm_backend_tmux_send_key "$WINDOW_TARGET" Enter; then
