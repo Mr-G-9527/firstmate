@@ -301,24 +301,134 @@ requeue_worker() {  # <meta_file> <corr> <window> <liveness>
 #
 # Iterate data/executor-jobs/*.meta (the in-flight receipts written by
 # fm-research-worker-spawn.sh on successful spawn). For each:
+#   * started_at older than the guard window (default 48h) -> archive the
+#     meta and skip the death check entirely. The 0826 incident proved
+#     that "alive-looking but actually dead" workers older than the guard
+#     window cannot be alive in any meaningful sense; batching 26 of them
+#     into one drain produced the lockstep re-spawn that overwhelmed the
+#     shared key. The guard runs BEFORE the task_type branch so it covers
+#     every lane that writes to this directory, not only report_research.
 #   * artifact present -> worker completed; drop the meta.
 #   * worker alive -> still running; leave the meta alone.
 #   * worker dead / missing / unreadable / ambiguous -> requeue.
 #
 # Only metas belonging to report_research tasks are reconciled; future
 # spawn-helper callers that share the executor-jobs dir but use a different
-# task_type are explicitly skipped via the task_type field.
+# task_type are explicitly skipped via the task_type field AFTER the
+# E1 guard has had a chance to evaluate them. This ordering matters:
+# the bug class is about age, not about lane, so a non-report_research
+# meta that is >48h old is just as dangerous to requeue as a report_research
+# one. Skipping the guard on non-report_research lanes would re-open the
+# 0826 lockstep risk for any other lane that uses this drain.
+
+# E1 death-check guard (regression: 0826 incident). Window is configurable
+# via FM_E1_GUARD_WINDOW_HOURS so the regression fixture can replay the
+# 0826 timeline without spinning the wall clock. Default 48h matches the
+# incident postmortem. The comparison uses integer UTC epoch seconds and
+# a strict `<` so a meta exactly at the boundary still participates in
+# death-check; this is consistent with the brief's "older than 48h"
+# wording. Metas lacking a parseable started_at, or with a started_at
+# that parses to the future (clock skew or mistakenly written deadline
+# field), are treated as ARCHIVED (fail-closed) so the guard cannot
+# re-create the original bug via permissive defaults.
+GUARD_WINDOW_HOURS="${FM_E1_GUARD_WINDOW_HOURS:-48}"
+# FM_E1_GUARD_NOW is a deliberate test seam: pass an RFC3339 UTC string
+# and the guard pins NOW to that timestamp instead of reading the wall
+# clock. Production code never sets it.
+if [ -n "${FM_E1_GUARD_NOW:-}" ]; then
+  NOW_EPOCH="$(date -u -d "$FM_E1_GUARD_NOW" +%s 2>/dev/null || echo 0)"
+else
+  NOW_EPOCH="$(date -u +%s 2>/dev/null || echo 0)"
+fi
+case "$NOW_EPOCH" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
+# DISABLED_GUARD flips the guard into fail-closed archive mode for every
+# meta: when the wall clock is unreadable we never want to fall through
+# to the death-check path (which would, on a cohort of "ancient alive"
+# metas, reproduce the 0826 lockstep).
+case "$NOW_EPOCH" in 0|-*) DISABLED_GUARD=1 ;; *) DISABLED_GUARD=0 ;; esac
+GUARD_EPOCH=$((NOW_EPOCH - GUARD_WINDOW_HOURS * 3600))
+
+# archive_root is the parent of all per-run archive snapshots. The
+# per-incident fixture state/executor-meta-archive-0826/ keeps its own
+# suffix to remain identifiable as a frozen historical snapshot; this
+# guard's runtime archive uses the bare path with a timestamped child
+# directory per drain run. The two namespaces never overlap, so a
+# post-mortem comparing the 0826 fixture against the runtime archive
+# still works.
+ARCHIVE_ROOT="${FM_E1_GUARD_ARCHIVE_DIR:-$STATE/executor-meta-archive}"
+ARCHIVED_COUNT=0
+KEPT_COUNT=0
+
+archive_meta() {  # <meta_file> <corr> <reason>
+  local meta_file=$1 corr=$2 reason=$3
+  local run_dir_ts run_dir
+  run_dir_ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
+  run_dir="${ARCHIVE_ROOT}/$run_dir_ts"
+  if [ ! -d "$run_dir" ]; then
+    mkdir -p "$run_dir" 2>/dev/null || {
+      echo "dispatch archive failed: corr=$corr reason=$reason (mkdir $run_dir)" >&2
+      return 1
+    }
+  fi
+  if mv -f "$meta_file" "$run_dir/$corr.meta" 2>/dev/null; then
+    echo "dispatch archived: corr=$corr reason=$reason" >&2
+    ARCHIVED_COUNT=$((ARCHIVED_COUNT + 1))
+    return 0
+  fi
+  echo "dispatch archive failed: corr=$corr reason=$reason (mv)" >&2
+  return 1
+}
+
 for META_FILE in "$EXECUTOR_JOBS_DIR"/*.meta; do
   [ -f "$META_FILE" ] || continue
+  META_CORR="$(resolve_meta_field "$META_FILE" corr || true)"
+  [ -n "$META_CORR" ] || continue
+
+  # E1 death-check guard runs FIRST and applies to every lane. Older-
+  # than-window metas are archived without any death check, regardless
+  # of artifact state or task_type continuation - the lockstep risk is
+  # about age, not lane. Three fail-closed paths converge here:
+  #   1. wall clock is unreadable (DISABLED_GUARD) -> archive every meta
+  #   2. started_at missing or unparseable -> archive (missing-started_at)
+  #   3. started_at parses to a future epoch (clock skew, mistakenly
+  #      written deadline field, or naive local-TZ string interpreted
+  #      non-UTC) -> archive (future-started_at)
+  # Path (3) is the inverse of the "missing" path: the original 0826
+  # lockstep came from treating ancient-but-alive as alive; treating
+  # future-but-parseable as alive would be the same shape of failure,
+  # just on the other side of NOW.
+  META_STARTED_AT="$(resolve_meta_field "$META_FILE" started_at || true)"
+  META_STARTED_EPOCH=""
+  if [ -n "$META_STARTED_AT" ]; then
+    META_STARTED_EPOCH="$(date -u -d "$META_STARTED_AT" +%s 2>/dev/null || true)"
+    case "$META_STARTED_EPOCH" in ''|*[!0-9]*) META_STARTED_EPOCH="" ;; esac
+  fi
+  if [ "$DISABLED_GUARD" = "1" ]; then
+    archive_meta "$META_FILE" "$META_CORR" "clock-unreadable" || true
+    continue
+  fi
+  if [ -z "$META_STARTED_EPOCH" ]; then
+    archive_meta "$META_FILE" "$META_CORR" "missing-started_at" || true
+    continue
+  fi
+  if [ "$META_STARTED_EPOCH" -gt "$NOW_EPOCH" ]; then
+    archive_meta "$META_FILE" "$META_CORR" "future-started_at" || true
+    continue
+  fi
+  if [ "$META_STARTED_EPOCH" -lt "$GUARD_EPOCH" ]; then
+    archive_meta "$META_FILE" "$META_CORR" "older-than-${GUARD_WINDOW_HOURS}h" || true
+    continue
+  fi
+  KEPT_COUNT=$((KEPT_COUNT + 1))
+
   META_TASK_TYPE="$(resolve_meta_field "$META_FILE" task_type || true)"
   case "$META_TASK_TYPE" in
     report_research) ;;
     *) continue ;;
   esac
-  META_CORR="$(resolve_meta_field "$META_FILE" corr || true)"
+
   META_ARTIFACT="$(resolve_meta_field "$META_FILE" artifact || true)"
   META_WINDOW="$(resolve_meta_field "$META_FILE" window || true)"
-  [ -n "$META_CORR" ] || continue
 
   if [ -n "$META_ARTIFACT" ] && [ -f "$META_ARTIFACT" ]; then
     rm -f "$META_FILE"
@@ -338,6 +448,13 @@ for META_FILE in "$EXECUTOR_JOBS_DIR"/*.meta; do
   fi
   requeue_worker "$META_FILE" "$META_CORR" "$META_WINDOW" "$LIVENESS" || true
 done
+
+# Summary line so supervisors can audit the guard's effect on every
+# drain without grepping individual archived lines. Goes to stdout (not
+# stderr) because it is a normal lifecycle line, not an error.
+if [ "$ARCHIVED_COUNT" -gt 0 ] || [ "$KEPT_COUNT" -gt 0 ]; then
+  echo "precheck: kept $KEPT_COUNT alive / archived $ARCHIVED_COUNT (>${GUARD_WINDOW_HOURS}h)"
+fi
 
 # ----- Main loop: dispatch queued items ------------------------------------
 # Promote any worker-death-rebuilt queue files into the regular queue
