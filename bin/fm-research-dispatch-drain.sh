@@ -84,6 +84,143 @@ extract_row_from_brief() {  # <brief_path>
   ' "$brief"
 }
 
+# capture_spawn_failure: persist a spawn-failure snapshot to
+# state/.dispatch-fail/<corr>/<reason>.log BEFORE the existing
+# .spawn.last.err rename runs, so an operator can find the real reason
+# without grepping the queue's stderr. The fail log is the source of
+# truth; the queue's `_fail_summary` JSON field is a convenience pointer
+# that may be missing if the jq update races with disk full / OOM.
+#
+# Reconcile notes (2026-09-01 pre-redteam):
+#   pre-D-1 path traversal: corr is sanitized to [A-Za-z0-9_-]+ with no
+#        leading dot and no `..` substring; any failing value falls
+#        into a shared "invalid-corr" subdir.
+#   pre-D-2/D-3 jq mut silent drop: caller appends queue-update-failed-at
+#        to the fail log itself when jq mut fails, so the fail log
+#        remains findable via filesystem walk even with no queue pointer.
+#   pre-D-4a misleading empty stderr section: only emit the section when
+#        a separate stderr file is provided; today the spawn helper
+#        merges stderr into spawn.out via 2>&1.
+#   pre-D-4b sensitive retention: cap at 10 logs per corr (oldest dropped
+#        by mtime before each new write).
+#   pre-D-5 TOCTOU on truncate+write: write to a sibling tmp, mv -f into
+#        place (atomic on same filesystem).
+#
+# Reconcile notes (2026-09-01 post-redteam):
+#   post-D-1 chmod silent swallow: drop the trailing `|| true` from
+#        chmod and mv -f so the caller can observe permission failures
+#        via stderr; the caller also stops suppressing stderr.
+#   post-D-2 unreadable spawn.out: an unreadable file produced
+#        `wc -c` = 0 → "(spawn.out is empty)", misleading the operator.
+#        Detect unreadable separately so the message says so.
+#   post-D-5 invalid-corr collision: every malformed corr collapsed to
+#        a single shared dir → cross-task retention conflict. Keep the
+#        shared `invalid-corr` dir but encode a sha1[:8] of the
+#        original corr into the filename so per-task evidence stays
+#        isolated within the fallback bucket.
+#
+# Out of scope (parked):
+#   post-D-4 pre-pass death-detection rebuilds queue JSON without
+#        `_fail_summary`; the helper here only fires on the spawn-fail
+#        main-loop branch. Monitoring that greps `_fail_summary` will
+#        miss worker-death retry evidence; that gap is a follow-up.
+#   post-D-1-b `.spawn.last.err` truncate-before-cat is a pre-existing
+#        ov-0824-A contract; the captain hard-constraint keeps it.
+capture_spawn_failure() {  # <corr> <reason> <spawn_out_path> <queue_file>
+  local corr_orig=$1 reason=$2 spawn_out=$3 queue_file=$4
+  local corr corr_hash fail_dir now bytes fail_log tmp_log
+  corr="$corr_orig"
+  case "$corr" in
+    ''|.*|*..*) corr="invalid-corr" ;;
+  esac
+  case "$corr" in
+    *[!A-Za-z0-9_-]*) corr="invalid-corr" ;;
+  esac
+  # post-D-5: when corr collapsed to invalid-corr, suffix the filename
+  # with a short hash of the original corr so two distinct malformed
+  # corrs don't write into the same log slot.
+  if [ "$corr" = "invalid-corr" ]; then
+    corr_hash="$(printf '%s' "$corr_orig" | sha1sum 2>/dev/null | awk '{print substr($1,1,8)}')"
+    case "$corr_hash" in
+      ''|*[!A-Za-z0-9]*) corr_hash="00000000" ;;
+    esac
+  else
+    corr_hash=""
+  fi
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  fail_dir="$STATE/.dispatch-fail/$corr"
+  if ! mkdir -p "$fail_dir"; then
+    echo "dispatch-fail mkdir failed: $fail_dir" >&2
+    return 1
+  fi
+  chmod 700 "$fail_dir" 2>/dev/null || true
+
+  # Cap retention at 10 logs per corr; drop the oldest by mtime first.
+  # The glob matches the file-name pattern we write below; the leading
+  # dot in `.reason.log.tmp.*` is intentionally excluded so in-flight
+  # tmp files are never GC'd.
+  set +u
+  existing=$(printf '%s\n' "$fail_dir"/[A-Za-z0-9_-]*.log 2>/dev/null | grep -v '^\[' | wc -l)
+  if [ "${existing:-0}" -gt 10 ]; then
+    # ls -1t prints newest-first; tail -n +11 keeps the rest = oldest.
+    ls -1t "$fail_dir"/[A-Za-z0-9_-]*.log 2>/dev/null \
+      | tail -n +11 \
+      | while read -r old; do
+          [ -n "$old" ] && rm -f -- "$old" 2>/dev/null || true
+        done
+  fi
+  set -u
+
+  if [ -n "$corr_hash" ]; then
+    fail_log="$fail_dir/$reason-$corr_hash.log"
+    tmp_log="$fail_dir/.$reason-$corr_hash.log.tmp.$$"
+  else
+    fail_log="$fail_dir/$reason.log"
+    tmp_log="$fail_dir/.$reason.log.tmp.$$"
+  fi
+
+  {
+    echo "==== dispatch-fail snapshot ===="
+    echo "captured_at=$now"
+    echo "task_id=$corr_orig"
+    echo "sanitized_task_id=$corr"
+    [ -n "$corr_hash" ] && echo "invalid_corr_sha1_8=$corr_hash"
+    echo "reason=$reason"
+    echo "queue_file=$queue_file"
+    echo "spawn_out=$spawn_out"
+    echo "--- spawn.out tail (last 200 lines, or full if <200) ---"
+    if [ -f "$spawn_out" ]; then
+      if [ -r "$spawn_out" ]; then
+        bytes="$(wc -c < "$spawn_out" 2>/dev/null || echo 0)"
+        if [ "${bytes:-0}" -gt 0 ]; then
+          tail -n 200 "$spawn_out" 2>/dev/null || true
+        else
+          echo "(spawn.out is empty)"
+        fi
+      else
+        echo "(spawn.out present but unreadable by current process: $spawn_out)"
+      fi
+    else
+      echo "(spawn.out missing: $spawn_out)"
+    fi
+    if [ -n "${SPAWN_STDERR_PATH:-}" ] && [ -f "${SPAWN_STDERR_PATH}" ]; then
+      echo "--- stderr summary (last 50 lines) ---"
+      tail -n 50 "${SPAWN_STDERR_PATH}" 2>/dev/null | head -50 || true
+    else
+      echo "--- stderr ---"
+      echo "(merged into spawn.out above via spawn helper 2>&1 redirection)"
+    fi
+  } > "$tmp_log" 2>/dev/null || true
+  chmod 600 "$tmp_log" 2>/dev/null || true
+  if ! mv -f "$tmp_log" "$fail_log" 2>/dev/null; then
+    rm -f "$tmp_log" 2>/dev/null || true
+    echo "dispatch-fail write failed: $fail_log" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$fail_log"
+}
+
 # requeue_worker: rebuild the queue file for a dead worker so the next drain
 # round re-spawns it. The queue file is rebuilt from the brief's embedded row
 # JSON, with .attempts inherited (incremented). worker.log is preserved as
@@ -252,12 +389,48 @@ for QUEUE_FILE in "$QUEUE_DIR"/*.json; do
     continue
   fi
   NEXT=$((ATTEMPTS + 1))
-  TMP_FILE="$(mktemp "$QUEUE_DIR/.retry.XXXXXX")"
-  if jq --argjson attempts "$NEXT" '.attempts=$attempts' "$QUEUE_FILE" >"$TMP_FILE"; then
-    chmod 600 "$TMP_FILE"
-    mv -f "$TMP_FILE" "$QUEUE_FILE"
+  REASON="spawn-fail-attempt-$NEXT"
+  # Capture the full failure snapshot before the queue-file mutation and
+  # the .spawn.last.err rename, so the evidence survives both transforms.
+  # Stderr propagates so a permission / disk-full error is visible; the
+  # helper itself returns 1 to signal capture failure, and we drop a
+  # sentinel evidence path so the queue's _fail_summary is never
+  # silently empty.
+  FAIL_LOG="$(capture_spawn_failure "$CORR" "$REASON" "$SPAWN_OUT" "$QUEUE_FILE" || true)"
+  if [ -z "${FAIL_LOG:-}" ] || [ ! -f "${FAIL_LOG:-}" ]; then
+    FAIL_LOG="(capture-failed:state/.dispatch-fail/$CORR/$REASON.log)"
+    echo "dispatch-fail capture did not produce a log; sentinel=$FAIL_LOG" >&2
+  fi
+  CAPTURED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  TMP_FILE="$(mktemp "$QUEUE_DIR/.retry.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$TMP_FILE" ] || [ ! -e "$TMP_FILE" ]; then
+    # post-D-3: mktemp failed (quota / noexec). Don't try to redirect
+    # jq output to an empty path; record the failure on the fail log
+    # and bail out of the queue-mutation step so the next drain cycle
+    # sees a sane ATTEMPTS value instead of silently retrying forever.
+    echo "dispatch retry: mktemp for queue tmp failed; leaving queue attempts unchanged" >&2
+    if [ -f "${FAIL_LOG:-}" ]; then
+      printf 'queue-mktemp-failed-at=%s\n' "$CAPTURED_AT" >> "$FAIL_LOG" 2>/dev/null || true
+    fi
   else
-    rm -f "$TMP_FILE"
+    if jq --argjson attempts "$NEXT" \
+           --arg reason "$REASON" \
+           --arg evidence "${FAIL_LOG:-}" \
+           --arg ts "$CAPTURED_AT" \
+           '.attempts=$attempts | ._fail_summary={captured_at:$ts, reason:$reason, evidence_log:$evidence}' \
+           "$QUEUE_FILE" >"$TMP_FILE"; then
+      chmod 600 "$TMP_FILE"
+      mv -f "$TMP_FILE" "$QUEUE_FILE"
+    else
+      rm -f "$TMP_FILE"
+      # pre-D-2/D-3 reconcile: the fail log is the source of truth; record
+      # the queue-update failure inline so an operator can find this
+      # snapshot via `ls state/.dispatch-fail/<corr>/` even when the
+      # queue's _fail_summary pointer is missing or stale.
+      if [ -n "${FAIL_LOG:-}" ] && [ -f "$FAIL_LOG" ]; then
+        printf 'queue-update-failed-at=%s\n' "$CAPTURED_AT" >> "$FAIL_LOG" 2>/dev/null || true
+      fi
+    fi
   fi
   # Preserve the last failed spawn's stderr as evidence (ov-0824-A).
   # The retry budget can burn silently when three attempts die for the
@@ -269,7 +442,11 @@ for QUEUE_FILE in "$QUEUE_DIR"/*.json; do
     cat "$SPAWN_OUT" >>"$SPAWN_LAST_ERR" 2>/dev/null || true
     rm -f "$SPAWN_OUT"
   fi
-  echo "dispatch retry pending: corr=$CORR seq=$SEQ attempt=$NEXT/$MAX_ATTEMPTS evidence=$SPAWN_LAST_ERR" >&2
+  if [ -n "${FAIL_LOG:-}" ] && [ -f "$FAIL_LOG" ]; then
+    echo "dispatch retry pending: corr=$CORR seq=$SEQ attempt=$NEXT/$MAX_ATTEMPTS evidence=$SPAWN_LAST_ERR fail_log=$FAIL_LOG" >&2
+  else
+    echo "dispatch retry pending: corr=$CORR seq=$SEQ attempt=$NEXT/$MAX_ATTEMPTS evidence=$SPAWN_LAST_ERR fail_log=${FAIL_LOG:-none}" >&2
+  fi
   if [ "$NEXT" -lt "$MAX_ATTEMPTS" ]; then
     fm_wake_append signal research-dispatch "retry corr=$CORR seq=$SEQ" || true
   else
