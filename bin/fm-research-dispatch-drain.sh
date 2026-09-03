@@ -57,6 +57,17 @@ SPAWN_HELPER="${FM_RESEARCH_WORKER_SPAWN:-$SCRIPT_DIR/fm-research-worker-spawn.s
 MAX_ATTEMPTS="${FM_RESEARCH_DISPATCH_RETRY_MAX:-3}"
 EXECUTOR_JOBS_DIR="${FM_EXECUTOR_JOBS_DIR:-$FM_HOME/data/executor-jobs}"
 DEATH_CHECK="${FM_RESEARCH_DEATH_CHECK_CMD:-fm_backend_tmux_agent_state}"
+# Startup grace for the death-check requeue decision (minutes). Headless
+# report_research workers run `claude -p` as a child of the pane's persistent
+# shell (see fm-research-worker-spawn.sh LAUNCH_CMD), so the pane is shell-only
+# until claude attaches. A `dead` verdict inside this window of started_at is
+# held (re-probed on the next drain) instead of requeued, so a slow start
+# cannot license a duplicate spawn. 0 disables. It only delays - never cancels -
+# a legitimate requeue: once older than the grace window a shell-only pane
+# requeues as before.
+DEATH_CHECK_GRACE_MINUTES="${FM_DEATH_CHECK_GRACE_MINUTES:-5}"
+case "$DEATH_CHECK_GRACE_MINUTES" in ''|*[!0-9]*) DEATH_CHECK_GRACE_MINUTES=5 ;; esac
+GRACE_SECONDS=$((DEATH_CHECK_GRACE_MINUTES * 60))
 LOCK="$STATE/.research-dispatch.lock"
 mkdir -p "$QUEUE_DIR" "$EXECUTOR_JOBS_DIR"
 case "$MAX_ATTEMPTS" in ''|*[!0-9]*) MAX_ATTEMPTS=3 ;; esac
@@ -442,11 +453,34 @@ for META_FILE in "$EXECUTOR_JOBS_DIR"/*.meta; do
     continue
   fi
   LIVENESS="$("$DEATH_CHECK" "$META_WINDOW" 2>/dev/null || true)"
-  if [ "$LIVENESS" = "alive" ]; then
-    echo "dispatch in-flight: corr=$META_CORR window=$META_WINDOW"
-    continue
-  fi
-  requeue_worker "$META_FILE" "$META_CORR" "$META_WINDOW" "$LIVENESS" || true
+  case "$LIVENESS" in
+    alive)
+      echo "dispatch in-flight: corr=$META_CORR window=$META_WINDOW"
+      continue
+      ;;
+    unreadable)
+      # Transient/ambiguous probe. The verifier's contract is that only a
+      # confident negative licenses a re-spawn; an uncertain tmux read must
+      # never authorize a duplicate. Hold the meta and re-probe next drain.
+      echo "dispatch probe-unreadable: corr=$META_CORR window=$META_WINDOW (hold, re-probe next drain)" >&2
+      continue
+      ;;
+    dead)
+      # Confident agent-absent. Apply the startup grace: a shell-only pane
+      # within GRACE_SECONDS of started_at is a slow start, not a death.
+      if [ "$GRACE_SECONDS" -gt 0 ] \
+         && [ $((NOW_EPOCH - META_STARTED_EPOCH)) -lt "$GRACE_SECONDS" ]; then
+        echo "dispatch starting-grace: corr=$META_CORR window=$META_WINDOW (age<${GRACE_SECONDS}s, hold)" >&2
+        continue
+      fi
+      requeue_worker "$META_FILE" "$META_CORR" "$META_WINDOW" "$LIVENESS" || true
+      ;;
+    *)
+      # missing / any other verdict: the window or session is gone (or the
+      # probe returned something unexpected) - requeue, keeping it observable.
+      requeue_worker "$META_FILE" "$META_CORR" "$META_WINDOW" "$LIVENESS" || true
+      ;;
+  esac
 done
 
 # Summary line so supervisors can audit the guard's effect on every

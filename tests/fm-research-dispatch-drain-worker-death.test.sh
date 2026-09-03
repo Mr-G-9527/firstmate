@@ -125,6 +125,12 @@ export STATE="$CASE/state"
 export FM_EXECUTOR_JOBS_DIR="$CASE/data/executor-jobs"
 export FM_RESEARCH_WORKER_SPAWN="$CASE/fakebin/spawn-helper"
 export FM_RESEARCH_DEATH_CHECK_CMD="$CASE/fakebin/death-check"
+# Pin the clock: fake metas use started_at=2026-08-26T00:00:00Z. Without a
+# pinned NOW the wall clock (>48h later) makes the E1 guard archive them
+# before the death check runs, silently defeating this regression. 12h age is
+# inside the 48h E1 window and past the 5m startup grace, so the
+# dead->requeue expectations below still hold.
+export FM_E1_GUARD_NOW="2026-08-26T12:00:00Z"
 export FM_FAKE_META_DIR="$CASE/data/executor-jobs"
 export FM_FAKE_ARTIFACT_DIR="$CASE/data"
 
