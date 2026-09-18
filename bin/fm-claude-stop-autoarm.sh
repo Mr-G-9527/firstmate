@@ -141,6 +141,76 @@ write_epoch() {  # <outcome>
   rm -f "$tmp" 2>/dev/null || true
 }
 
+# Fleet snapshot summary for the next turn's captain-facing reply. The full
+# discipline rationale lives at data/fm-fleet-discipline-review/report.md; the
+# short version: rule #1 of memory/fleet-coordination-discipline says "run
+# bin/fm-fleet-snapshot.sh --json before every captain-facing reply". Manual
+# compliance proved insufficient; this hook is the natural "next turn is about
+# to start" boundary on claude, so it writes a bounded one-line summary the
+# next system reminder can prepend. The behavior must NEVER change this
+# script's exit code (harness hook reads it), never emit on stderr (stderr is
+# reserved for the rewake / fail banner), and never block more than the
+# snapshot's own runtime + a hard 2s ceiling.
+# Inline jq filter for fleet snapshot summary. Kept as a here-doc so the
+# inner double-quotes can reference jq's $vars without bash-escape gymnastics.
+_fleet_summary_jq_filter() {
+  cat <<'JQFILTER'
+def n: if . == null then 0 else . end;
+def caps: now | todate;
+# backlog "since" is a date-only string ("YYYY-MM-DD"); pad to ISO-8601
+# with T00:00:00Z so fromdateiso8601 can parse it.
+def since_to_epoch:
+  (. // "") | select(. != "") | . + "T00:00:00Z" | fromdateiso8601? // 0;
+def stale24_count:
+  ([.backlog.records // []
+    | .[]
+    | select(.hold_kind == "captain")
+    | (.since | since_to_epoch) as $t
+    | select($t > 0 and (now - $t) > 86400)] | length);
+def inflight_count:
+  ([.backlog.records // [] | .[] | select(.state == "in_flight")] | length);
+def open_dec_count:
+  ([.backlog.records // [] | .[] | select(.hold_kind == "captain")] | length);
+def tasks_count:
+  (.tasks // []) | length;
+"[fleet \(caps)] in_flight=\(inflight_count | n) open_dec=\(open_dec_count | n) stale24h=\(stale24_count | n) tasks=\(tasks_count | n)"
+JQFILTER
+}
+
+write_fleet_summary() {
+  local snap="$STATE/.fleet-snapshot-prepend.txt"
+  local line=""
+  local jq_tmp=""
+  if command -v jq >/dev/null 2>&1 \
+     && command -v timeout >/dev/null 2>&1 \
+     && [ -x "$SCRIPT_DIR/fm-fleet-snapshot.sh" ]; then
+    # Write the jq filter to a tmp file so the inner double-quoted filter
+    # can reference jq's $vars without bash-escape gymnastics, AND so the
+    # 2s timeout below can wrap the entire snapshot | jq pipeline as one
+    # unit (plain `timeout 2s A | B` only bounds A — B can block on stdin
+    # indefinitely after A exits).
+    jq_tmp=$(mktemp 2>/dev/null) || jq_tmp=""
+    if [ -n "$jq_tmp" ]; then
+      _fleet_summary_jq_filter > "$jq_tmp" || { rm -f "$jq_tmp"; jq_tmp=""; }
+    fi
+    if [ -n "$jq_tmp" ]; then
+      # shellcheck disable=SC2016 # $0/$1 are positional args to the subshell, not bash expansions
+      line=$(timeout 2s bash -c '
+          "$0" --json 2>/dev/null | jq -r -f "$1" 2>/dev/null
+        ' "$SCRIPT_DIR/fm-fleet-snapshot.sh" "$jq_tmp" 2>/dev/null) || line=""
+      rm -f "$jq_tmp"
+    fi
+  fi
+  case "$line" in
+    '[fleet '*']'*) : ;;
+    '') line='[snapshot skipped: jq/timeout/snapshot unavailable]' ;;
+    *) line=$(printf '%s' "$line" | cut -c1-200) ;;
+  esac
+  printf '%s\n' "$line" > "$snap.tmp.$$" 2>/dev/null \
+    && mv -f "$snap.tmp.$$" "$snap" 2>/dev/null \
+    || rm -f "$snap.tmp.$$" 2>/dev/null || true
+}
+
 write_epoch arming
 
 # X mode cadence: source the generated config so an X instance polls at its
@@ -204,6 +274,7 @@ done
 # left to supervise, so close quietly instead of waking the model.
 if ! need_supervision; then
   write_epoch clean
+  write_fleet_summary
   [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
   exit 0
 fi
@@ -211,6 +282,7 @@ fi
 if [ "$HEALTHY" -eq 1 ]; then
   if fm_failure_episode_reset "$STATE"; then
     write_epoch clean
+    write_fleet_summary
     [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
     exit 0
   fi
